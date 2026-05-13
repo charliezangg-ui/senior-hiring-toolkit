@@ -3128,5 +3128,46 @@ deck-stage > section {
 })();
 </script>
 
+<!-- patch: force deck-stage init after full page load (fixes GitHub Pages slot timing) -->
+<script>
+(function patchDeckStage() {
+  function tryInit() {
+    var deck = document.querySelector('deck-stage');
+    if (!deck) return;
+    // If no slide is active yet, force initialization
+    var active = deck.querySelector('section.active');
+    if (!active) {
+      try {
+        deck._collectSlides();
+        deck._restoreIndex();
+        // If still not active, fall back to goTo(0)
+        if (!deck.querySelector('section.active')) {
+          deck.goTo(0);
+        }
+      } catch(e) {
+        // Last resort: directly activate first section
+        var sections = deck.querySelectorAll('section');
+        if (sections.length > 0) {
+          sections.forEach(function(s) { s.classList.remove('active'); });
+          sections[0].classList.add('active');
+        }
+      }
+    }
+  }
+  // Try immediately, then again after delays to handle various timing scenarios
+  if (document.readyState === 'complete') {
+    tryInit();
+    setTimeout(tryInit, 100);
+    setTimeout(tryInit, 500);
+  } else {
+    window.addEventListener('load', function() {
+      tryInit();
+      setTimeout(tryInit, 100);
+      setTimeout(tryInit, 500);
+    });
+  }
+})();
+</script>
+
 </body>
 </html>
