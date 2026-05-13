@@ -7,6 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Alfa+Slab+One&family=Archivo+Narrow:wght@400;500;600;700&family=Caveat+Brush&family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700;900&family=Noto+Serif+SC:wght@700;900&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.bunny.net">
+<link href="https://fonts.bunny.net/css?family=alfa-slab-one:400|archivo-narrow:400,500,600,700|caveat-brush:400|dm-mono:400,500|noto-sans-sc:400,500,600,700,900|noto-serif-sc:700,900&display=swap" rel="stylesheet">
 <script>
 /**
  * <deck-stage> — reusable web component for HTML decks.
@@ -659,6 +661,14 @@
   --cobalt:var(--pp-blue);
 }
 
+/* font-display: swap 确保字体未加载时先用 fallback 显示文字，不出现空白 */
+@font-face { font-family:'Alfa Slab One'; font-style:normal; font-weight:400; font-display:swap;
+  src: local('Alfa Slab One'), local('AlfaSlabOne-Regular'); }
+@font-face { font-family:'Caveat Brush'; font-style:normal; font-weight:400; font-display:swap;
+  src: local('Caveat Brush'), local('CaveatBrush-Regular'); }
+@font-face { font-family:'DM Mono'; font-style:normal; font-weight:400; font-display:swap;
+  src: local('DM Mono'), local('DMMono-Regular'); }
+
 html,body{margin:0;background:#111;}
 *{box-sizing:border-box;}
 body{font-family:'Archivo Narrow', 'Noto Sans SC', system-ui, sans-serif; color:var(--ink);}
@@ -670,12 +680,12 @@ deck-stage > section{
 }
 
 .display{
-  font-family:'Alfa Slab One', 'Noto Serif SC', serif;
+  font-family:'Alfa Slab One', Georgia, 'Noto Serif SC', serif;
   letter-spacing:.005em; line-height:.88;
   text-transform:uppercase;
 }
-.script{ font-family:'Caveat Brush', cursive; text-transform:lowercase;}
-.mono{ font-family:'DM Mono', monospace;}
+.script{ font-family:'Caveat Brush', 'Comic Sans MS', cursive; text-transform:lowercase;}
+.mono{ font-family:'DM Mono', 'Courier New', monospace;}
 
 .stamp-orange{ color:var(--orange); text-shadow: 6px 6px 0 var(--red), 12px 12px 0 var(--red-deep);}
 .stamp-blue{ color:var(--blue); text-shadow: 6px 6px 0 var(--red);}
