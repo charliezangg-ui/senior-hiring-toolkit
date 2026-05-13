@@ -1,0 +1,3122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>高招工具包 — AI Skill 重新定义高管招聘效率</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Alfa+Slab+One&family=Archivo+Narrow:wght@400;500;600;700&family=Caveat+Brush&family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700;900&family=Noto+Serif+SC:wght@700;900&display=swap" rel="stylesheet">
+<script>
+/**
+ * <deck-stage> — reusable web component for HTML decks.
+ *
+ * Handles:
+ *  (a) speaker notes — reads <script type="application/json" id="speaker-notes">
+ *      and posts {slideIndexChanged: N} to the parent window on nav.
+ *  (b) keyboard navigation — ←/→, PgUp/PgDn, Space, Home/End, number keys.
+ *  (c) press R to reset to slide 0 (with a tasteful keyboard hint).
+ *  (d) bottom-center overlay showing slide count + hints, fades out on idle.
+ *  (e) auto-scaling — inner canvas is a fixed design size (default 1920×1080)
+ *      scaled with `transform: scale()` to fit the viewport, letterboxed.
+ *      Set the `noscale` attribute to render at authored size (1:1) — the
+ *      PPTX exporter sets this so its DOM capture sees unscaled geometry.
+ *  (f) print — `@media print` lays every slide out as its own page at the
+ *      design size, so the browser's Print → Save as PDF produces a clean
+ *      one-page-per-slide PDF with no extra setup.
+ *
+ * Slides are HIDDEN, not unmounted. Non-active slides stay in the DOM with
+ * `visibility: hidden` + `opacity: 0`, so their state (videos, iframes,
+ * form inputs, React trees) is preserved across navigation.
+ *
+ * Lifecycle event — the component dispatches a `slidechange` CustomEvent on
+ * itself whenever the active slide changes (including the initial mount).
+ * The event bubbles and composes out of shadow DOM, so you can listen on
+ * the <deck-stage> element or on document:
+ *
+ *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
+ *     e.detail.index         // new 0-based index
+ *     e.detail.previousIndex // previous index, or -1 on init
+ *     e.detail.total         // total slide count
+ *     e.detail.slide         // the new active slide element
+ *     e.detail.previousSlide // the prior slide element, or null on init
+ *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+ *   });
+ *
+ * Persistence: none at the deck level. The host app keeps the current slide
+ * in its own URL (?slide=) and re-delivers it via location.hash on load, so a
+ * bare load with no hash always starts at slide 1.
+ *
+ * Usage:
+ *   <deck-stage width="1920" height="1080">
+ *     <section data-label="Title">...</section>
+ *     <section data-label="Agenda">...</section>
+ *   </deck-stage>
+ *
+ * Slides are the direct element children of <deck-stage>. Each slide is
+ * automatically tagged with:
+ *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
+ */
+
+(() => {
+  const DESIGN_W_DEFAULT = 1920;
+  const DESIGN_H_DEFAULT = 1080;
+  const OVERLAY_HIDE_MS = 1800;
+  const VALIDATE_ATTR = 'no_overflowing_text,no_overlapping_text,slide_sized_text';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const stylesheet = `
+    :host {
+      position: fixed;
+      inset: 0;
+      display: block;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .canvas {
+      position: relative;
+      transform-origin: center center;
+      flex-shrink: 0;
+      background: #fff;
+      will-change: transform;
+    }
+
+    /* Slides live in light DOM (via <slot>) so authored CSS still applies.
+       We absolutely position each slotted child to stack them. */
+    ::slotted(*) {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      box-sizing: border-box !important;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    ::slotted([data-deck-active]) {
+      opacity: 1;
+      pointer-events: auto;
+      visibility: visible;
+    }
+
+    /* Tap zones for mobile — back/forward thirds like Stories.
+       Transparent, no visible UI, don't block the overlay. */
+    .tapzones {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      z-index: 2147482000;
+      pointer-events: none;
+    }
+    .tapzone {
+      flex: 1;
+      pointer-events: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Only activate tap zones on coarse pointers (touch devices). */
+    @media (hover: hover) and (pointer: fine) {
+      .tapzones { display: none; }
+    }
+
+    .overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translate(-50%, 6px) scale(0.92);
+      filter: blur(6px);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: #000;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 12px;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 260ms ease;
+      transform-origin: center bottom;
+      z-index: 2147483000;
+      user-select: none;
+    }
+    .overlay[data-visible] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0) scale(1);
+      filter: blur(0);
+    }
+
+    .btn {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      cursor: default;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.72);
+      transition: background 140ms ease, color 140ms ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+    .btn:active { background: rgba(255,255,255,0.18); }
+    .btn:focus { outline: none; }
+    .btn:focus-visible { outline: none; }
+    .btn::-moz-focus-inner { border: 0; }
+    .btn svg { width: 14px; height: 14px; display: block; }
+    .btn.reset {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      color: rgba(255,255,255,0.72);
+    }
+    .btn.reset .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1;
+      color: rgba(255,255,255,0.88);
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }
+
+    .count {
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      font-weight: 500;
+      padding: 0 8px;
+      min-width: 42px;
+      text-align: center;
+      font-size: 12px;
+    }
+    .count .sep { color: rgba(255,255,255,0.45); margin: 0 3px; font-weight: 400; }
+    .count .total { color: rgba(255,255,255,0.55); }
+
+    .divider {
+      width: 1px;
+      height: 14px;
+      background: rgba(255,255,255,0.18);
+      margin: 0 2px;
+    }
+
+    /* ── Print: one page per slide, no chrome ────────────────────────────
+       The screen layout stacks every slide at inset:0 inside a scaled
+       canvas; for print we want them in document flow at the authored
+       design size so the browser paginates one slide per sheet. The
+       @page size is set from the width/height attributes via the inline
+       <style id="deck-stage-print-page"> that connectedCallback injects
+       into <head> (the @page at-rule has no effect inside shadow DOM). */
+    @media print {
+      :host {
+        position: static;
+        inset: auto;
+        background: none;
+        overflow: visible;
+        color: inherit;
+      }
+      .stage { position: static; display: block; }
+      .canvas {
+        transform: none !important;
+        width: auto !important;
+        height: auto !important;
+        background: none;
+        will-change: auto;
+      }
+      ::slotted(*) {
+        position: relative !important;
+        inset: auto !important;
+        width: var(--deck-design-w) !important;
+        height: var(--deck-design-h) !important;
+        box-sizing: border-box !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto;
+        break-after: page;
+        page-break-after: always;
+        break-inside: avoid;
+        overflow: hidden;
+      }
+      ::slotted(*:last-child) {
+        break-after: auto;
+        page-break-after: auto;
+      }
+      .overlay, .tapzones { display: none !important; }
+    }
+  `;
+
+  class DeckStage extends HTMLElement {
+    static get observedAttributes() { return ['width', 'height', 'noscale']; }
+
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._index = 0;
+      this._slides = [];
+      this._notes = [];
+      this._hideTimer = null;
+      this._mouseIdleTimer = null;
+
+      this._onKey = this._onKey.bind(this);
+      this._onResize = this._onResize.bind(this);
+      this._onSlotChange = this._onSlotChange.bind(this);
+      this._onMouseMove = this._onMouseMove.bind(this);
+      this._onTapBack = this._onTapBack.bind(this);
+      this._onTapForward = this._onTapForward.bind(this);
+    }
+
+    get designWidth() {
+      return parseInt(this.getAttribute('width'), 10) || DESIGN_W_DEFAULT;
+    }
+    get designHeight() {
+      return parseInt(this.getAttribute('height'), 10) || DESIGN_H_DEFAULT;
+    }
+
+    connectedCallback() {
+      this._render();
+      this._loadNotes();
+      this._syncPrintPageRule();
+      window.addEventListener('keydown', this._onKey);
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      // Initial collection + layout happens via slotchange, which fires on mount.
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener('keydown', this._onKey);
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
+    }
+
+    attributeChangedCallback() {
+      if (this._canvas) {
+        this._canvas.style.width = this.designWidth + 'px';
+        this._canvas.style.height = this.designHeight + 'px';
+        this._canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+        this._canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+        this._fit();
+        this._syncPrintPageRule();
+      }
+    }
+
+    _render() {
+      const style = document.createElement('style');
+      style.textContent = stylesheet;
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const canvas = document.createElement('div');
+      canvas.className = 'canvas';
+      canvas.style.width = this.designWidth + 'px';
+      canvas.style.height = this.designHeight + 'px';
+      canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+      canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+
+      const slot = document.createElement('slot');
+      slot.addEventListener('slotchange', this._onSlotChange);
+      canvas.appendChild(slot);
+      stage.appendChild(canvas);
+
+      // Tap zones (mobile): left third = back, right third = forward.
+      const tapzones = document.createElement('div');
+      tapzones.className = 'tapzones export-hidden';
+      tapzones.setAttribute('aria-hidden', 'true');
+      tapzones.setAttribute('data-noncommentable', '');
+      const tzBack = document.createElement('div');
+      tzBack.className = 'tapzone tapzone--back';
+      const tzMid = document.createElement('div');
+      tzMid.className = 'tapzone tapzone--mid';
+      tzMid.style.pointerEvents = 'none';
+      const tzFwd = document.createElement('div');
+      tzFwd.className = 'tapzone tapzone--fwd';
+      tzBack.addEventListener('click', this._onTapBack);
+      tzFwd.addEventListener('click', this._onTapForward);
+      tapzones.append(tzBack, tzMid, tzFwd);
+
+      // Overlay: compact, solid black, with clickable controls.
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay export-hidden';
+      overlay.setAttribute('role', 'toolbar');
+      overlay.setAttribute('aria-label', 'Deck controls');
+      overlay.setAttribute('data-noncommentable', '');
+      overlay.innerHTML = `
+        <button class="btn prev" type="button" aria-label="Previous slide" title="Previous (←)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>
+        </button>
+        <span class="count" aria-live="polite"><span class="current">1</span><span class="sep">/</span><span class="total">1</span></span>
+        <button class="btn next" type="button" aria-label="Next slide" title="Next (→)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+        <span class="divider"></span>
+        <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+      `;
+
+      overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
+      overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
+      overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+
+      this._root.append(style, stage, tapzones, overlay);
+      this._canvas = canvas;
+      this._slot = slot;
+      this._overlay = overlay;
+      this._countEl = overlay.querySelector('.current');
+      this._totalEl = overlay.querySelector('.total');
+    }
+
+    /** @page must live in the document stylesheet — it's a no-op inside
+     *  shadow DOM. Inject/update a single <head> style tag so the print
+     *  sheet matches the design size and Save-as-PDF yields one slide per
+     *  page with no margins. */
+    _syncPrintPageRule() {
+      const id = 'deck-stage-print-page';
+      let tag = document.getElementById(id);
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = id;
+        document.head.appendChild(tag);
+      }
+      tag.textContent =
+        '@page { size: ' + this.designWidth + 'px ' + this.designHeight + 'px; margin: 0; } ' +
+        '@media print { html, body { margin: 0 !important; padding: 0 !important; background: none !important; overflow: visible !important; height: auto !important; } ' +
+        '* { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }';
+    }
+
+    _onSlotChange() {
+      this._collectSlides();
+      this._restoreIndex();
+      this._applyIndex({ showOverlay: false, broadcast: true, reason: 'init' });
+      this._fit();
+    }
+
+    _collectSlides() {
+      const assigned = this._slot.assignedElements({ flatten: true });
+      this._slides = assigned.filter((el) => {
+        // Skip template/style/script nodes even if someone slots them.
+        const tag = el.tagName;
+        return tag !== 'TEMPLATE' && tag !== 'SCRIPT' && tag !== 'STYLE';
+      });
+
+      this._slides.forEach((slide, i) => {
+        const n = i + 1;
+        // Determine a label for comment flow: prefer explicit data-label,
+        // then an existing data-screen-label, then first heading, else "Slide".
+        let label = slide.getAttribute('data-label');
+        if (!label) {
+          const existing = slide.getAttribute('data-screen-label');
+          if (existing) {
+            // Strip any leading number the author may have included.
+            label = existing.replace(/^\s*\d+\s*/, '').trim() || existing;
+          }
+        }
+        if (!label) {
+          const h = slide.querySelector('h1, h2, h3, [data-title]');
+          if (h) label = (h.textContent || '').trim().slice(0, 40);
+        }
+        if (!label) label = 'Slide';
+        slide.setAttribute('data-screen-label', `${pad2(n)} ${label}`);
+
+        // Validation attribute for comment flow / auto-checks.
+        if (!slide.hasAttribute('data-om-validate')) {
+          slide.setAttribute('data-om-validate', VALIDATE_ATTR);
+        }
+
+        slide.setAttribute('data-deck-slide', String(i));
+      });
+
+      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
+    }
+
+    _loadNotes() {
+      const tag = document.getElementById('speaker-notes');
+      if (!tag) { this._notes = []; return; }
+      try {
+        const parsed = JSON.parse(tag.textContent || '[]');
+        if (Array.isArray(parsed)) this._notes = parsed;
+      } catch (e) {
+        console.warn('[deck-stage] Failed to parse #speaker-notes JSON:', e);
+        this._notes = [];
+      }
+    }
+
+    _restoreIndex() {
+      // The host's ?slide= param is delivered as a #<int> hash (1-indexed) on
+      // the iframe src. No hash → slide 1; the deck itself keeps no position
+      // state across loads.
+      const h = (location.hash || '').match(/^#(\d+)$/);
+      if (h) {
+        const n = parseInt(h[1], 10) - 1;
+        if (n >= 0 && n < this._slides.length) this._index = n;
+      }
+    }
+
+    _applyIndex({ showOverlay = true, broadcast = true, reason = 'init' } = {}) {
+      if (!this._slides.length) return;
+      const prev = this._prevIndex == null ? -1 : this._prevIndex;
+      const curr = this._index;
+      // Keep the iframe's own hash in sync so an in-iframe location.reload()
+      // (reload banner path in viewer-handle.ts) lands on the current slide,
+      // not the stale deep-link hash from initial load.
+      try { history.replaceState(null, '', '#' + (curr + 1)); } catch (e) {}
+      this._slides.forEach((s, i) => {
+        if (i === curr) s.setAttribute('data-deck-active', '');
+        else s.removeAttribute('data-deck-active');
+      });
+      if (this._countEl) this._countEl.textContent = String(curr + 1);
+
+      if (broadcast) {
+        // (1) Legacy: host-window postMessage for speaker-notes renderers.
+        try { window.postMessage({ slideIndexChanged: curr }, '*'); } catch (e) {}
+
+        // (2) In-page CustomEvent on the <deck-stage> element itself.
+        //     Bubbles and composes out of shadow DOM so slide code can listen:
+        //       document.querySelector('deck-stage').addEventListener('slidechange', e => {
+        //         e.detail.index, e.detail.previousIndex, e.detail.total, e.detail.slide, e.detail.reason
+        //       });
+        const detail = {
+          index: curr,
+          previousIndex: prev,
+          total: this._slides.length,
+          slide: this._slides[curr] || null,
+          previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
+          reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+        };
+        this.dispatchEvent(new CustomEvent('slidechange', {
+          detail,
+          bubbles: true,
+          composed: true,
+        }));
+      }
+
+      this._prevIndex = curr;
+      if (showOverlay) this._flashOverlay();
+    }
+
+    _flashOverlay() {
+      if (!this._overlay) return;
+      this._overlay.setAttribute('data-visible', '');
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      this._hideTimer = setTimeout(() => {
+        this._overlay.removeAttribute('data-visible');
+      }, OVERLAY_HIDE_MS);
+    }
+
+    _fit() {
+      if (!this._canvas) return;
+      // PPTX export sets noscale so the DOM capture sees authored-size
+      // geometry — the scaled canvas is in shadow DOM, so the exporter's
+      // resetTransformSelector can't reach .canvas.style.transform directly.
+      if (this.hasAttribute('noscale')) {
+        this._canvas.style.transform = 'none';
+        return;
+      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = Math.min(vw / this.designWidth, vh / this.designHeight);
+      this._canvas.style.transform = `scale(${s})`;
+    }
+
+    _onResize() { this._fit(); }
+
+    _onMouseMove() {
+      // Keep overlay visible while mouse moves; hide after idle.
+      this._flashOverlay();
+    }
+
+    _onTapBack(e) {
+      e.preventDefault();
+      this._go(this._index - 1, 'tap');
+    }
+
+    _onTapForward(e) {
+      e.preventDefault();
+      this._go(this._index + 1, 'tap');
+    }
+
+    _onKey(e) {
+      // Ignore when the user is typing.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let handled = true;
+
+      if (key === 'ArrowRight' || key === 'PageDown' || key === ' ' || key === 'Spacebar') {
+        this._go(this._index + 1, 'keyboard');
+      } else if (key === 'ArrowLeft' || key === 'PageUp') {
+        this._go(this._index - 1, 'keyboard');
+      } else if (key === 'Home') {
+        this._go(0, 'keyboard');
+      } else if (key === 'End') {
+        this._go(this._slides.length - 1, 'keyboard');
+      } else if (key === 'r' || key === 'R') {
+        this._go(0, 'keyboard');
+      } else if (/^[0-9]$/.test(key)) {
+        // 1..9 jump to that slide; 0 jumps to 10.
+        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        if (n < this._slides.length) this._go(n, 'keyboard');
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        this._flashOverlay();
+      }
+    }
+
+    _go(i, reason = 'api') {
+      if (!this._slides.length) return;
+      const clamped = Math.max(0, Math.min(this._slides.length - 1, i));
+      if (clamped === this._index) {
+        this._flashOverlay();
+        return;
+      }
+      this._index = clamped;
+      this._applyIndex({ showOverlay: true, broadcast: true, reason });
+    }
+
+    // Public API ------------------------------------------------------------
+
+    /** Current slide index (0-based). */
+    get index() { return this._index; }
+    /** Total slide count. */
+    get length() { return this._slides.length; }
+    /** Programmatically navigate. */
+    goTo(i) { this._go(i, 'api'); }
+    next() { this._go(this._index + 1, 'api'); }
+    prev() { this._go(this._index - 1, 'api'); }
+    reset() { this._go(0, 'api'); }
+  }
+
+  if (!customElements.get('deck-stage')) {
+    customElements.define('deck-stage', DeckStage);
+  }
+})();
+
+</script>
+<style>
+:root{
+  /* Peoples Platform — Block & Bold
+     ref: github.com/zarazhangrui/beautiful-html-templates/templates/peoples-platform */
+  --pp-blue:#2C2CDC;
+  --pp-blue-deep:#1B1BB0;
+  --pp-orange:#F2A03A;
+  --pp-orange-deep:#E89321;
+  --pp-red:#E83A2A;
+  --pp-red-deep:#B7281C;
+  --ink:#0E0E14;
+  --ink-deep:#050508;
+  --cream:#F4E9D6;
+  --paper:#F5F2EA;
+  /* Token names kept for existing rules — 语义：焦糖色带 = 强调橙，干邑色带 = 阴影红 */
+  --caramel:var(--pp-orange);
+  --cognac:var(--pp-red);
+  --cognac-deep:var(--pp-red-deep);
+  --gold:var(--pp-orange-deep);
+  --greige:#4A4A52;
+  --olive:#1F6F54;
+  --blue:var(--pp-blue);
+  --blue-deep:var(--pp-blue-deep);
+  --orange:var(--pp-orange);
+  --orange-deep:var(--pp-orange-deep);
+  --red:var(--pp-red);
+  --red-deep:var(--pp-red-deep);
+  --cobalt:var(--pp-blue);
+}
+
+html,body{margin:0;background:#111;}
+*{box-sizing:border-box;}
+body{font-family:'Archivo Narrow', 'Noto Sans SC', system-ui, sans-serif; color:var(--ink);}
+
+deck-stage > section{
+  width:1920px; height:1080px;
+  position:relative; overflow:hidden;
+  background:var(--paper);
+}
+
+.display{
+  font-family:'Alfa Slab One', 'Noto Serif SC', serif;
+  letter-spacing:.005em; line-height:.88;
+  text-transform:uppercase;
+}
+.script{ font-family:'Caveat Brush', cursive; text-transform:lowercase;}
+.mono{ font-family:'DM Mono', monospace;}
+
+.stamp-orange{ color:var(--orange); text-shadow: 6px 6px 0 var(--red), 12px 12px 0 var(--red-deep);}
+.stamp-blue{ color:var(--blue); text-shadow: 6px 6px 0 var(--red);}
+.stamp-cream{ color:var(--cream); text-shadow: 6px 6px 0 var(--red-deep);}
+
+.grain::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background-image:
+    radial-gradient(rgba(0,0,0,.06) 1px, transparent 1px),
+    radial-gradient(rgba(255,255,255,.05) 1px, transparent 1px);
+  background-size: 3px 3px, 5px 5px;
+  background-position: 0 0, 1px 2px;
+  mix-blend-mode:multiply;
+  opacity:.45;
+}
+
+/* ============ 01 COVER ============ */
+.s-cover{ background:var(--blue); color:var(--cream);}
+.s-cover .frame{ position:absolute; inset:48px; border:6px solid var(--cream);}
+.s-cover .meta-top{
+  position:absolute; top:90px; left:90px; right:90px;
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'DM Mono', monospace; font-size:24px; letter-spacing:.18em; color:var(--cream);
+}
+.s-cover .meta-top .pill{ border:3px solid var(--cream); padding:8px 20px; border-radius:999px;}
+.s-cover .center{
+  position:absolute; left:0; right:0; top:260px;
+  display:flex; flex-direction:column; align-items:center;
+}
+.s-cover .title{
+  font-family:'Alfa Slab One', serif; font-size:160px; line-height:.86;
+  color:var(--orange);
+  text-shadow: 10px 10px 0 var(--red), 20px 20px 0 var(--red-deep);
+  text-align:center;
+}
+.s-cover .cn-subtitle{
+  font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:72px; color:var(--cream); margin-top:40px;
+  letter-spacing:.08em;
+}
+.s-cover .row2{ display:flex; align-items:center; gap:34px; margin-top:46px;}
+.s-cover .for{ font-family:'Caveat Brush', cursive; font-size:80px; color:var(--cream); transform:rotate(-5deg);}
+.s-cover .sub{
+  font-family:'Noto Sans SC', sans-serif; font-weight:700; font-size:42px; color:var(--cream);
+  letter-spacing:.06em;
+}
+.s-cover .footline{
+  position:absolute; bottom:120px; left:0; right:0;
+  display:flex; justify-content:center; gap:32px; align-items:center;
+  font-family:'DM Mono', monospace; font-size:24px; letter-spacing:.22em; color:var(--cream);
+}
+.s-cover .dot{width:10px; height:10px; background:var(--caramel); border-radius:50%;}
+
+/* ============ 02 MANIFESTO ============ */
+.s-manifesto{ background:var(--cream); color:var(--ink);}
+.s-manifesto .topbar{
+  position:absolute; top:0; left:0; right:0; height:90px; background:var(--blue);
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 0 90px; color:var(--cream);
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+}
+.s-manifesto .layout{
+  position:absolute; left:0; right:0; top:90px; bottom:0;
+  display:grid; grid-template-columns: 1fr 1fr;
+}
+.s-manifesto .left-col{
+  padding:60px 60px 60px 100px;
+  display:flex; flex-direction:column; justify-content:center;
+}
+.s-manifesto .kicker{
+  font-family:'DM Mono', monospace; letter-spacing:.22em; font-size:24px;
+  color:var(--red); margin-bottom:30px;
+}
+.s-manifesto .headline{
+  font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:64px; line-height:1.15; color:var(--blue);
+}
+.s-manifesto .headline .y{
+  color:var(--orange); text-shadow: 5px 5px 0 var(--red);
+}
+.s-manifesto .headline .scriptline{
+  display:inline-block; font-family:'Caveat Brush', cursive; color:var(--red);
+  font-size:72px; transform:rotate(-2deg); margin: 0 6px;
+  text-transform:lowercase;
+}
+.s-manifesto .desc{
+  margin-top:30px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:24px; line-height:1.65; color:var(--ink);
+  max-width:760px;
+}
+.s-manifesto .right-col{
+  display:flex; align-items:center; justify-content:center;
+  padding:40px;
+}
+/* Venn Diagram */
+.venn-container{
+  position:relative; width:700px; height:560px;
+}
+.venn-circle{
+  position:absolute; width:420px; height:420px; border-radius:50%;
+  top:70px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  text-align:center; line-height:1.3;
+}
+.venn-circle.left{
+  left:0;
+  background:rgba(44,76,220,0.09);
+  border:4px solid var(--blue);
+  color:var(--ink);
+}
+.venn-circle.right{
+  right:0;
+  background:rgba(242,160,58,0.14);
+  border:4px solid var(--orange);
+  color:var(--ink);
+}
+.venn-circle .venn-title{
+  font-size:30px; margin-bottom:10px;
+}
+.venn-circle .venn-en{
+  font-family:'DM Mono', monospace; font-size:16px; letter-spacing:.08em;
+  font-weight:500; opacity:.8;
+}
+.venn-circle .venn-items{
+  font-size:18px; font-weight:500; margin-top:14px; line-height:1.6;
+  color:var(--ink); opacity:.85;
+}
+.venn-circle.left .venn-items{ padding-right:80px; }
+.venn-circle.right .venn-items{ padding-left:80px; }
+.venn-overlap{
+  position:absolute;
+  left:50%; top:50%; transform:translate(-50%,-50%);
+  width:160px; height:160px;
+  border-radius:50%;
+  overflow:hidden;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  text-align:center; z-index:2;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 4px,
+      var(--orange) 4px,
+      var(--orange) 6px
+    );
+  background-color: rgba(244,233,214,.85);
+}
+.venn-overlap .venn-inner{
+  background:var(--cream);
+  border-radius:50%;
+  width:110px; height:110px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  text-align:center;
+  box-shadow: 0 0 0 3px var(--blue);
+}
+.venn-overlap .venn-and{
+  font-family:'Alfa Slab One', serif; font-size:32px; color:var(--orange);
+  line-height:1;
+}
+.venn-overlap .venn-andlabel{
+  font-family:'Noto Sans SC', sans-serif; font-weight:700; font-size:13px;
+  color:var(--blue); margin-top:4px; line-height:1.2;
+}
+.venn-top-label{
+  position:absolute; top:0; left:50%; transform:translateX(-50%);
+  font-family:'Caveat Brush', cursive; font-size:36px; color:var(--blue);
+}
+.venn-bottom-label{
+  position:absolute; bottom:0; left:50%; transform:translateX(-50%);
+  font-family:'DM Mono', monospace; font-size:16px; letter-spacing:.15em;
+  color:var(--ink); opacity:.6;
+}
+.s-manifesto .footrow{
+  position:absolute; bottom:40px; left:100px; right:100px;
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'DM Mono', monospace; font-size:24px; letter-spacing:.18em; color:var(--ink);
+}
+
+/* ============ 03 PILLARS ============ */
+.s-pillars{ background:var(--paper);}
+.s-pillars .head{
+  padding:70px 90px 30px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-pillars .head h2{
+  margin:0; font-family:'Alfa Slab One', serif; font-size:100px; line-height:.9;
+  color:var(--blue); text-shadow:5px 5px 0 var(--red); text-transform:uppercase;
+}
+.s-pillars .head .lede{
+  max-width:580px; padding-left:50px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:26px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--ink);
+}
+.s-pillars .grid{
+  display:grid; grid-template-columns:repeat(3, 1fr);
+  height: calc(100% - 280px);
+}
+.s-pillars .col{
+  padding:50px 44px 50px;
+  border-right:4px solid var(--ink);
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
+.s-pillars .col:last-child{border-right:none;}
+.s-pillars .col .num{
+  font-family:'Alfa Slab One', serif; font-size:140px; line-height:.88;
+  color:var(--orange); text-shadow:5px 5px 0 var(--red);
+}
+.s-pillars .col .tag{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+  color:var(--ink); margin-top:12px; padding-top:16px;
+  border-top:3px solid var(--ink); align-self:flex-start;
+}
+.s-pillars .col h3{
+  margin:24px 0 16px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:44px; line-height:1.15; color:var(--blue);
+}
+.s-pillars .col p{
+  margin:0; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:24px; line-height:1.55; color:var(--ink); max-width:460px;
+}
+.s-pillars .col .work-type{
+  margin-top:auto; padding-top:16px;
+  display:inline-flex; align-items:center; gap:10px;
+  font-family:'DM Mono', monospace; font-size:18px; letter-spacing:.12em;
+  font-weight:600;
+}
+.s-pillars .col .work-type.brain{
+  color:var(--ink); border-top:3px solid var(--ink);
+}
+.s-pillars .col .work-type.muscle{
+  color:var(--blue); border-top:3px solid var(--orange);
+}
+.s-pillars .col .work-type .dot-indicator{
+  width:12px; height:12px; border-radius:50%; flex-shrink:0;
+}
+.s-pillars .col .work-type.brain .dot-indicator{ background:var(--ink);}
+.s-pillars .col .work-type.muscle .dot-indicator{ background:var(--orange);}
+.s-pillars .col.alt{ background:var(--blue-deep);}
+.s-pillars .col.alt .tag{color:rgba(244,233,214,.75); border-top-color:rgba(244,233,214,.25);}
+.s-pillars .col.alt h3{color:var(--orange); text-shadow:4px 4px 0 var(--red);}
+.s-pillars .col.alt p{color:var(--cream);}
+.s-pillars .col.alt .work-type.muscle{
+  color:var(--cream); border-top-color:var(--orange);
+}
+.s-pillars .col.alt .work-type.muscle .dot-indicator{ background:var(--orange);}
+
+/* ============ 04/05 PAIN POINTS (shared) ============ */
+.s-pain-pm, .s-pain-hi{
+  background:var(--paper);
+  display:flex; flex-direction:column;   /* flex-column drives layout */
+}
+
+/* --- topbar --- */
+.s-pain-pm .topbar, .s-pain-hi .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+}
+.s-pain-pm .topbar{ background:var(--blue); color:var(--cream);}
+.s-pain-hi .topbar{ background:var(--blue); color:var(--cream);}
+
+/* --- header row: venn badge + title + kicker --- */
+.pain-head{
+  flex-shrink:0;
+  padding:40px 90px 24px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.pain-head .pain-title{
+  margin:0; flex-shrink:0;
+  font-family:'Alfa Slab One', serif; line-height:.9;
+  text-transform:uppercase;
+}
+.s-pain-pm .pain-title{
+  font-size:100px;
+  color:var(--blue); text-shadow:5px 5px 0 var(--red);
+}
+.s-pain-hi .pain-title{
+  font-size:100px;
+  color:var(--blue); text-shadow:5px 5px 0 var(--red);
+}
+.pain-head .pain-lede{
+  max-width:580px; padding-left:50px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:26px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+/* venn mini badge in lede */
+.venn-badge{
+  display:inline-flex; align-items:center; gap:12px;
+  margin-bottom:8px;
+}
+.venn-mini{
+  position:relative; width:64px; height:44px; flex-shrink:0;
+}
+.vm-circle{
+  position:absolute; width:38px; height:38px; border-radius:50%; top:3px;
+  border:3px solid;
+}
+.vm-circle.vm-left{ left:0; border-color:var(--blue); background:rgba(44,76,220,.10);}
+.vm-circle.vm-right{ right:0; border-color:var(--orange); background:rgba(242,160,58,.12);}
+.vm-circle.dim{ opacity:.22;}
+.vm-circle.active{ opacity:1;}
+.vm-overlap{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:14px; height:14px; border-radius:50%;
+  background:
+    repeating-linear-gradient(-45deg, transparent, transparent 2px, var(--orange) 2px, var(--orange) 3px);
+  background-color:rgba(244,233,214,.9);
+}
+.venn-badge-label{
+  font-family:'DM Mono', monospace; font-size:16px; letter-spacing:.12em;
+  color:var(--ink); opacity:.5;
+}
+
+/* ============ SLIDE 4: PM — 2-column layout ============ */
+.s-pain-pm .pm-grid{
+  flex:1; min-height:0;          /* fill remaining space */
+  display:grid; grid-template-columns:1fr 1fr;
+}
+.s-pain-pm .pm-col{
+  padding:50px 60px 40px 90px;
+  display:flex; flex-direction:column;
+}
+.s-pain-pm .pm-col + .pm-col{
+  border-left:4px solid var(--ink);
+  padding-left:60px;
+}
+.s-pain-pm .pm-col .pm-num{
+  font-family:'Alfa Slab One', serif; font-size:110px; line-height:.85;
+  color:var(--orange); text-shadow:5px 5px 0 var(--red);
+}
+.s-pain-pm .pm-col .pm-tag{
+  font-family:'DM Mono', monospace; font-size:20px; letter-spacing:.18em;
+  color:var(--ink); margin-top:14px; padding-top:14px;
+  border-top:3px solid var(--ink); align-self:flex-start;
+}
+.s-pain-pm .pm-col h3{
+  margin:22px 0 16px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:40px; line-height:1.15; color:var(--ink);
+}
+.s-pain-pm .pm-col p{
+  margin:0; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:24px; line-height:1.55; color:var(--ink); max-width:500px;
+}
+.s-pain-pm .pm-col .pm-badge{
+  margin-top:auto; padding-top:16px;
+  display:inline-flex; align-items:center; gap:10px;
+  font-family:'DM Mono', monospace; font-size:18px; letter-spacing:.12em;
+  font-weight:600; color:var(--blue);
+  border-top:3px solid var(--blue);
+}
+.s-pain-pm .pm-col .pm-badge .dot-indicator{
+  width:12px; height:12px; border-radius:50%; background:var(--blue); flex-shrink:0;
+}
+
+/* ============ SLIDE 5: HI — big statement layout ============ */
+.s-pain-hi .hi-body{
+  flex:1; min-height:0;          /* fill remaining space */
+  padding:0 90px;
+  display:flex; flex-direction:column; justify-content:center;
+}
+.s-pain-hi .hi-question{
+  font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:56px; line-height:1.2; color:var(--ink);
+  margin:0 0 30px; max-width:1200px;
+}
+.s-pain-hi .hi-question .hi-accent{
+  color:var(--orange);
+  font-family:'Caveat Brush', cursive; font-size:62px;
+  display:inline; transform:rotate(-1deg);
+}
+.s-pain-hi .hi-desc{
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:26px; line-height:1.6; color:var(--ink);
+  max-width:1100px; margin:0 0 36px;
+}
+.s-pain-hi .hi-desc b{ font-weight:800;}
+.s-pain-hi .hi-flow{
+  display:flex; align-items:center; gap:0; margin:0 0 30px;
+}
+.s-pain-hi .hi-flow .hi-step{
+  font-family:'Noto Sans SC', sans-serif; font-weight:700;
+  font-size:24px; color:var(--ink);
+  padding:14px 30px; background:rgba(242,160,58,.06);
+  border:2px solid var(--greige); border-radius:8px;
+}
+.s-pain-hi .hi-flow .hi-step.highlight{
+  background:var(--blue-deep); color:var(--cream);
+  font-weight:900; box-shadow:4px 4px 0 var(--red);
+}
+.s-pain-hi .hi-flow .hi-arrow{
+  font-family:'DM Mono', monospace; font-size:28px; color:var(--ink);
+  padding:0 14px; opacity:.5;
+}
+.s-pain-hi .hi-tag{
+  display:inline-flex; align-items:center; gap:10px;
+  font-family:'DM Mono', monospace; font-size:18px; letter-spacing:.12em;
+  font-weight:600; color:var(--ink);
+  padding-top:16px; border-top:3px solid var(--ink);
+}
+.s-pain-hi .hi-tag .dot-indicator{
+  width:12px; height:12px; border-radius:50%; background:var(--blue); flex-shrink:0;
+}
+
+/* --- shared footer --- */
+.pain-foot{
+  flex-shrink:0; height:70px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:22px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.5);
+}
+.pain-foot b{ font-weight:900; color:var(--ink);}
+.pain-foot .mono{
+  font-family:'DM Mono', monospace; font-size:24px; letter-spacing:.18em;
+}
+
+/* ============ PART 2 DIVIDER ============ */
+.s-part2{ background:var(--blue-deep); color:var(--cream);}
+.s-part2 .frame{ position:absolute; inset:48px; border:6px solid var(--cream);}
+.s-part2 .part2-top{
+  position:absolute; top:100px; left:100px; right:100px;
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'DM Mono', monospace; letter-spacing:.22em; font-size:24px;
+}
+.s-part2 .part2-center{
+  position:absolute; left:100px; right:100px; top:50%; transform:translateY(-50%);
+  text-align:center;
+}
+.s-part2 .part2-center .pre{
+  font-family:'Caveat Brush', cursive; color:var(--orange);
+  font-size:72px; transform:rotate(-3deg); display:inline-block;
+}
+.s-part2 .part2-center h1{
+  margin:10px 0 0; font-family:'Alfa Slab One', serif;
+  font-size:200px; line-height:.88; color:var(--orange);
+  text-shadow: 10px 10px 0 var(--red), 20px 20px 0 var(--red-deep);
+}
+.s-part2 .part2-center .sub{
+  margin-top:40px; font-family:'Noto Sans SC', sans-serif; font-weight:700;
+  font-size:48px; color:var(--cream); letter-spacing:.06em;
+}
+
+/* ============ 07 ARCHITECTURE — 路由器+子Skill ============ */
+.s-arch{
+  background:var(--paper);
+  display:flex; flex-direction:column;
+}
+.s-arch .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+  background:var(--blue); color:var(--cream);
+}
+.s-arch .arch-head{
+  flex-shrink:0;
+  padding:30px 90px 20px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-arch .arch-title{
+  font-family:'Alfa Slab One', serif; font-size:80px; line-height:.9;
+  color:var(--blue); text-shadow:4px 4px 0 var(--red);
+}
+.s-arch .arch-lede{
+  max-width:560px; padding-left:40px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:24px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+/* diagram area */
+.s-arch .arch-diagram{
+  flex:1; min-height:0;
+  padding:40px 90px 20px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:0;
+}
+/* router box */
+.arch-router{
+  width:650px; padding:20px 0;
+  text-align:center;
+  background:var(--blue-deep); color:var(--cream); border-radius:12px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:900; font-size:28px;
+  letter-spacing:.04em;
+  box-shadow:6px 6px 0 var(--red);
+  position:relative;
+  margin-bottom:30px;
+}
+.arch-router .arch-router-sub{
+  font-family:'DM Mono', monospace; font-weight:400; font-size:16px;
+  letter-spacing:.12em; opacity:.7; margin-top:4px;
+}
+/* 3 skill boxes */
+.arch-skills{
+  display:flex; gap:30px; justify-content:center;
+}
+.arch-skill-box{
+  width:360px; padding:22px 28px;
+  border:4px solid var(--ink); border-radius:10px;
+  background:var(--cream);
+  position:relative;
+}
+.arch-skill-box .ask-num{
+  font-family:'Alfa Slab One', serif; font-size:48px; line-height:.9;
+  color:var(--orange); text-shadow:3px 3px 0 var(--red);
+}
+.arch-skill-box .ask-tag{
+  font-family:'DM Mono', monospace; font-size:14px; letter-spacing:.15em;
+  color:var(--ink); margin-top:6px; padding-top:6px;
+  border-top:3px solid var(--ink); display:inline-block;
+}
+.arch-skill-box h3{
+  margin:10px 0 8px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:26px; line-height:1.2; color:var(--blue);
+}
+.arch-skill-box p{
+  margin:0; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.5; color:var(--ink);
+}
+.arch-skill-box.alt{
+  background:var(--blue-deep); border-color:var(--blue-deep);
+}
+.arch-skill-box.alt .ask-num{
+  color:var(--cream); text-shadow:3px 3px 0 var(--red);
+}
+.arch-skill-box.alt h3{ color:var(--orange); text-shadow:3px 3px 0 var(--red);}
+.arch-skill-box.alt p{ color:var(--cream);}
+.arch-skill-box.alt .ask-tag{ color:var(--cream); border-top-color:rgba(244,233,214,.35);}
+/* infra bar */
+.arch-infra{
+  margin-top:16px;
+  width:1160px;
+  padding:18px 40px;
+  background:var(--blue-deep); color:var(--cream); border-radius:10px;
+  display:flex; align-items:center; gap:30px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:18px;
+}
+.arch-infra .infra-label{
+  font-family:'DM Mono', monospace; font-weight:500; font-size:16px;
+  letter-spacing:.15em; color:var(--orange);
+  border-right:3px solid rgba(255,255,255,.2);
+  padding-right:24px; white-space:nowrap;
+}
+.arch-infra .infra-items{
+  display:flex; gap:16px; flex-wrap:wrap;
+}
+.arch-infra .infra-chip{
+  padding:6px 16px; border-radius:6px;
+  background:rgba(255,255,255,.08); border:2px solid rgba(255,255,255,.15);
+  font-size:16px; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  color:var(--cream); white-space:nowrap;
+}
+.arch-foot{
+  flex-shrink:0; height:60px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:20px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.5);
+}
+.arch-foot .mono{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+}
+
+/* ============ 08 FLOW — Benchmark 执行流程 ============ */
+.s-flow{
+  background:var(--cream);
+  display:flex; flex-direction:column;
+}
+.s-flow .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+  background:var(--blue); color:var(--cream);
+}
+.s-flow .flow-head{
+  flex-shrink:0;
+  padding:24px 90px 16px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-flow .flow-title{
+  font-family:'Alfa Slab One', serif; font-size:72px; line-height:.9;
+  color:var(--blue); text-shadow:4px 4px 0 var(--red);
+}
+.s-flow .flow-lede{
+  max-width:580px; padding-left:40px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:22px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+/* phase grid */
+.s-flow .flow-grid{
+  flex:1; min-height:0;
+  display:grid; grid-template-columns:repeat(4, 1fr);
+  padding:0;
+}
+.flow-phase{
+  padding:28px 32px 20px;
+  border-right:4px solid var(--ink);
+  display:flex; flex-direction:column;
+}
+.flow-phase:last-child{ border-right:none;}
+.flow-phase .fp-num{
+  font-family:'Alfa Slab One', serif; font-size:64px; line-height:.85;
+  color:var(--orange); text-shadow:4px 4px 0 var(--red);
+}
+.flow-phase .fp-tag{
+  font-family:'DM Mono', monospace; font-size:13px; letter-spacing:.16em;
+  color:var(--ink); margin-top:8px; padding-top:8px;
+  border-top:3px solid var(--ink); display:inline-block; align-self:flex-start;
+}
+.flow-phase h3{
+  margin:14px 0 10px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:28px; line-height:1.2; color:var(--blue);
+}
+.flow-phase .fp-desc{
+  margin:0 0 14px; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.5; color:var(--ink);
+}
+.flow-phase .fp-still{
+  margin:0 0 10px;
+  flex:0 0 auto;
+  width:100%;
+  height:108px;
+  border-radius:8px;
+  overflow:hidden;
+  border:2px solid rgba(14,14,20,.18);
+  box-shadow:0 2px 10px rgba(44,44,220,.08);
+}
+.flow-phase .fp-still img{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  object-position:top center;
+  display:block;
+  cursor:zoom-in;
+}
+
+/* Flow slide stills — click-to-zoom lightbox */
+.flow-img-lightbox{
+  position:fixed;
+  inset:0;
+  z-index:2147483646;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:min(48px, 5vw);
+  background:rgba(0,0,0,.86);
+  opacity:0;
+  visibility:hidden;
+  transition:opacity .22s ease, visibility .22s ease;
+  cursor:zoom-out;
+}
+.flow-img-lightbox.open{
+  opacity:1;
+  visibility:visible;
+}
+.flow-img-lightbox img{
+  max-width:min(92vw, 1680px);
+  max-height:88vh;
+  width:auto;
+  height:auto;
+  object-fit:contain;
+  border-radius:10px;
+  box-shadow:0 12px 60px rgba(0,0,0,.55);
+  cursor:default;
+  pointer-events:auto;
+}
+.flow-img-lightbox-close{
+  position:absolute;
+  top:20px;
+  right:24px;
+  width:44px;
+  height:44px;
+  border:0;
+  border-radius:999px;
+  background:rgba(255,255,255,.12);
+  color:#fff;
+  font-size:28px;
+  line-height:1;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  transition:background .15s ease;
+}
+.flow-img-lightbox-close:hover{ background:rgba(255,255,255,.22); }
+.flow-img-lightbox-close:focus{ outline:2px solid rgba(255,255,255,.6); outline-offset:2px; }
+.s-flow .flow-phase .fp-still{ height:96px;}
+.s-interview .flow-phase .fp-still{ height:124px;}
+.s-research .flow-phase .fp-still{ height:96px;}
+/* tech detail chips */
+.flow-phase .fp-details{
+  margin-top:auto;
+  display:flex; flex-direction:column; gap:8px;
+}
+.flow-phase .fp-detail{
+  padding:10px 14px; border-radius:8px;
+  background:rgba(44,76,220,.06); border:2px solid rgba(14,14,20,.14);
+  font-family:'Noto Sans SC', sans-serif; font-weight:700;
+  font-size:16px; line-height:1.35; color:var(--ink);
+}
+.flow-phase .fp-detail .detail-label{
+  font-family:'DM Mono', monospace; font-size:12px; letter-spacing:.12em;
+  color:var(--ink); opacity:.5; display:block; margin-bottom:4px;
+}
+.flow-phase:nth-child(even){ background:rgba(44,76,220,.04);}
+.flow-foot{
+  flex-shrink:0; height:60px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:20px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.55);
+}
+.flow-foot .mono{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+}
+
+/* ============ INTERVIEW FLOW ============ */
+.s-interview{
+  background:var(--cream);
+  display:flex; flex-direction:column;
+}
+.s-interview .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+  background:var(--blue); color:var(--cream);
+}
+.s-interview .flow-head{
+  flex-shrink:0;
+  padding:24px 90px 16px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-interview .flow-title{
+  font-family:'Alfa Slab One', serif; font-size:72px; line-height:.9;
+  color:var(--blue); text-shadow:4px 4px 0 var(--red);
+}
+.s-interview .flow-lede{
+  max-width:580px; padding-left:40px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:22px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+.s-interview .flow-grid{
+  flex:1; min-height:0;
+  display:grid; grid-template-columns:repeat(3, 1fr);
+  padding:0;
+}
+.s-interview .flow-phase{
+  padding:28px 32px 20px;
+  border-right:4px solid var(--ink);
+  display:flex; flex-direction:column;
+}
+.s-interview .flow-phase:last-child{ border-right:none;}
+.s-interview .flow-phase .fp-num{
+  font-family:'Alfa Slab One', serif; font-size:64px; line-height:.85;
+  color:var(--blue); text-shadow:3px 3px 0 var(--red);
+}
+.s-interview .flow-phase .fp-tag{
+  font-family:'DM Mono', monospace; font-size:13px; letter-spacing:.16em;
+  color:var(--ink); margin-top:8px; padding-top:8px;
+  border-top:3px solid var(--ink); display:inline-block; align-self:flex-start;
+}
+.s-interview .flow-phase h3{
+  margin:14px 0 10px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:28px; line-height:1.2; color:var(--blue);
+}
+.s-interview .flow-phase .fp-desc{
+  margin:0 0 14px; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.5; color:var(--ink);
+}
+.s-interview .flow-phase .fp-details{
+  margin-top:auto;
+  display:flex; flex-direction:column; gap:8px;
+}
+.s-interview .flow-phase .fp-detail{
+  padding:10px 14px; border-radius:8px;
+  background:rgba(44,76,220,.06); border:2px solid rgba(14,14,20,.14);
+  font-family:'Noto Sans SC', sans-serif; font-weight:700;
+  font-size:16px; line-height:1.35; color:var(--ink);
+}
+.s-interview .flow-phase .fp-detail .detail-label{
+  font-family:'DM Mono', monospace; font-size:12px; letter-spacing:.12em;
+  color:var(--ink); opacity:.5; display:block; margin-bottom:4px;
+}
+.s-interview .flow-phase:nth-child(even){ background:rgba(44,76,220,.04);}
+.s-interview .flow-foot{
+  flex-shrink:0; height:60px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:20px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.55);
+}
+.s-interview .flow-foot .mono{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+}
+
+/* ============ RESEARCH FLOW ============ */
+.s-research{
+  background:var(--cream);
+  display:flex; flex-direction:column;
+}
+.s-research .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+  background:var(--blue); color:var(--cream);
+}
+.s-research .flow-head{
+  flex-shrink:0;
+  padding:24px 90px 16px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-research .flow-title{
+  font-family:'Alfa Slab One', serif; font-size:72px; line-height:.9;
+  color:var(--blue); text-shadow:4px 4px 0 var(--red);
+}
+.s-research .flow-lede{
+  max-width:580px; padding-left:40px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:22px; line-height:1.5; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+.s-research .flow-grid{
+  flex:1; min-height:0;
+  display:grid; grid-template-columns:repeat(4, 1fr);
+  padding:0;
+}
+.s-research .flow-phase{
+  padding:28px 32px 20px;
+  border-right:4px solid var(--ink);
+  display:flex; flex-direction:column;
+}
+.s-research .flow-phase:last-child{ border-right:none;}
+.s-research .flow-phase .fp-num{
+  font-family:'Alfa Slab One', serif; font-size:64px; line-height:.85;
+  color:var(--orange); text-shadow:4px 4px 0 var(--red);
+}
+.s-research .flow-phase .fp-tag{
+  font-family:'DM Mono', monospace; font-size:13px; letter-spacing:.16em;
+  color:var(--ink); margin-top:8px; padding-top:8px;
+  border-top:3px solid var(--ink); display:inline-block; align-self:flex-start;
+}
+.s-research .flow-phase h3{
+  margin:14px 0 10px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:28px; line-height:1.2; color:var(--blue);
+}
+.s-research .flow-phase .fp-desc{
+  margin:0 0 14px; font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.5; color:var(--ink);
+}
+.s-research .flow-phase .fp-details{
+  margin-top:auto;
+  display:flex; flex-direction:column; gap:8px;
+}
+.s-research .flow-phase .fp-detail{
+  padding:10px 14px; border-radius:8px;
+  background:rgba(44,76,220,.05); border:2px solid rgba(14,14,20,.14);
+  font-family:'Noto Sans SC', sans-serif; font-weight:700;
+  font-size:16px; line-height:1.35; color:var(--ink);
+}
+.s-research .flow-phase .fp-detail .detail-label{
+  font-family:'DM Mono', monospace; font-size:12px; letter-spacing:.12em;
+  color:var(--ink); opacity:.5; display:block; margin-bottom:4px;
+}
+.s-research .flow-phase:nth-child(even){ background:rgba(44,76,220,.03);}
+.s-research .flow-foot{
+  flex-shrink:0; height:60px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:20px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.55);
+}
+.s-research .flow-foot .mono{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+}
+
+/* ============ PART 3 DIVIDER（改进方向） ============ */
+.s-part3{ background:var(--blue-deep); color:var(--cream);}
+.s-part3 .frame{ position:absolute; inset:50px; border:6px solid var(--cream);}
+.s-part3 .part3-top{
+  position:absolute; top:100px; left:100px; right:100px;
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'DM Mono', monospace; letter-spacing:.22em; font-size:24px; color:var(--cream);
+}
+.s-part3 .part3-center{
+  position:absolute; left:100px; right:100px; top:320px;
+  text-align:center;
+}
+.s-part3 .part3-center .pre{
+  font-family:'Caveat Brush', cursive; color:var(--orange);
+  font-size:80px; transform:rotate(-3deg); display:inline-block;
+}
+.s-part3 .part3-center h1{
+  margin:10px 0 0; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:160px; line-height:1.1; color:var(--cream);
+  text-shadow: 8px 8px 0 var(--red), 16px 16px 0 var(--red-deep);
+}
+.s-part3 .part3-center .sub{
+  margin-top:20px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:36px; color:var(--cream); letter-spacing:.04em;
+}
+
+/* ============ DEMO SLIDES ============ */
+.s-demo{
+  background:var(--cream);
+  display:flex; flex-direction:column;
+}
+.s-demo .topbar{
+  flex-shrink:0; height:90px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:24px;
+  background:var(--blue); color:var(--cream);
+}
+.s-demo .demo-head{
+  flex-shrink:0;
+  padding:18px 90px 14px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-demo .demo-title{
+  font-family:'Alfa Slab One', serif; font-size:48px; line-height:.9;
+  color:var(--blue); text-shadow:4px 4px 0 var(--red);
+}
+.s-demo .demo-lede{
+  max-width:560px; padding-left:32px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.45; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+.s-demo .demo-body{
+  flex:1; min-height:0;
+  padding:20px 90px 16px;
+  display:grid; grid-template-columns:340px 1fr;
+  gap:28px; align-items:stretch;
+}
+.s-demo .demo-left{
+  display:flex; flex-direction:column; gap:12px;
+}
+.s-demo .demo-card{
+  padding:14px 18px; border-radius:10px;
+  border:3px solid var(--ink);
+  background:var(--paper);
+  font-family:'Noto Sans SC', sans-serif;
+}
+.s-demo .demo-card .card-label{
+  font-family:'DM Mono', monospace; font-size:11px; letter-spacing:.14em;
+  color:var(--blue); margin-bottom:4px; display:block;
+}
+.s-demo .demo-card h4{
+  margin:0 0 4px; font-weight:900; font-size:18px; color:var(--ink); line-height:1.3;
+}
+.s-demo .demo-card p{
+  margin:0; font-weight:500; font-size:14px; line-height:1.45; color:var(--ink);
+}
+.s-demo .demo-right{
+  display:flex; align-items:stretch; justify-content:center;
+  min-height:0;
+}
+.s-demo .demo-screen{
+  width:100%;
+  min-height:300px;
+  border-radius:14px;
+  background:var(--blue-deep);
+  border:4px solid var(--ink);
+  display:flex; align-items:center; justify-content:center;
+  flex-direction:column; gap:14px;
+  font-family:'DM Mono', monospace; color:rgba(244,233,214,.65);
+  font-size:18px; letter-spacing:.1em;
+  position:relative; overflow:hidden;
+}
+.s-demo .demo-screen .screen-icon{
+  font-size:48px; opacity:.5;
+}
+.s-demo .demo-screen .screen-text{
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; color:var(--greige); opacity:.7; text-align:center;
+  padding:0 40px;
+}
+/* --- video embed --- */
+.s-demo .demo-screen.has-video{ background:#000; cursor:pointer; }
+.s-demo .demo-video{
+  position:absolute; inset:0; width:100%; height:100%;
+  object-fit:contain; border-radius:10px;
+}
+.s-demo .screen-overlay{
+  position:absolute; inset:0;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px;
+  background:rgba(0,0,0,.45); transition:opacity .4s;
+  z-index:2; border-radius:12px;
+}
+.s-demo .demo-screen.playing .screen-overlay{ opacity:0; pointer-events:none; }
+.s-demo .screen-overlay .play-btn{
+  width:72px; height:72px; border-radius:50%;
+  background:var(--orange); color:var(--ink);
+  display:flex; align-items:center; justify-content:center;
+  font-size:28px; padding-left:5px;
+  box-shadow:4px 4px 0 var(--red);
+  transition:transform .2s;
+}
+.s-demo .screen-overlay:hover .play-btn{ transform:scale(1.08); }
+.s-demo .demo-foot{
+  flex-shrink:0; height:60px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:20px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.55);
+}
+.s-demo .demo-foot .mono{
+  font-family:'DM Mono', monospace; font-size:22px; letter-spacing:.18em;
+}
+.s-demo .demo-foot .demo-link{
+  color:var(--blue); text-decoration:underline; text-underline-offset:3px;
+  font-weight:700; transition:color .2s;
+}
+.s-demo .demo-foot .demo-link:hover{ color:var(--red); }
+.s-demo .demo-inline-link{
+  color:var(--blue); text-decoration:underline; text-underline-offset:3px;
+  font-weight:700; transition:color .15s ease;
+}
+.s-demo .demo-inline-link:hover{ color:var(--red); }
+
+/* ============ SLIDE: ROADMAP (限制 & 改进) ============ */
+.s-roadmap{
+  background:var(--cream); display:flex; flex-direction:column;
+}
+.s-roadmap .topbar{
+  flex-shrink:0; height:56px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:20px;
+  background:var(--blue); color:var(--cream);
+}
+.s-roadmap .rm-head{
+  flex-shrink:0; padding:6px 90px 4px;
+  display:flex; justify-content:space-between; align-items:center;
+}
+.s-roadmap .rm-title{
+  font-family:'Alfa Slab One', serif; font-size:34px; line-height:.9;
+  color:var(--blue); text-shadow:2px 2px 0 var(--red);
+}
+.s-roadmap .rm-lede{
+  max-width:520px; padding-left:28px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:14px; line-height:1.35; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+.s-roadmap .rm-grid{
+  flex:1; min-height:0;
+  display:grid; grid-template-columns:repeat(4, 1fr);
+  border-top:4px solid var(--ink);
+}
+.s-roadmap .rm-col{
+  padding:18px 24px 14px;
+  border-right:4px solid var(--ink);
+  display:flex; flex-direction:column;
+}
+.s-roadmap .rm-col:last-child{ border-right:none; }
+.s-roadmap .rm-col:nth-child(even){ background:rgba(44,76,220,.03); }
+
+/* -- column header -- */
+.s-roadmap .rm-col .rc-tag{
+  font-family:'DM Mono', monospace; font-size:12px; letter-spacing:.14em;
+  color:var(--blue); margin-bottom:4px;
+}
+.s-roadmap .rm-col .rc-name{
+  margin:0 0 12px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:22px; line-height:1.2; color:var(--ink);
+}
+
+/* -- section labels -- */
+.s-roadmap .rc-section-label{
+  font-family:'DM Mono', monospace; font-size:11px; letter-spacing:.12em;
+  color:var(--red); margin-bottom:5px; font-weight:700;
+}
+
+/* -- limits section (top half) -- */
+.s-roadmap .rc-limits{
+  flex:1; display:flex; flex-direction:column; gap:8px;
+}
+.s-roadmap .rc-lim{
+  flex:1; padding:8px 12px 6px; border-left:4px solid var(--orange);
+  background:rgba(44,76,220,.05); border-radius:0 4px 4px 0;
+  font-family:'Noto Sans SC', sans-serif;
+}
+.s-roadmap .rc-lim strong{
+  display:block; font-weight:700; font-size:16px; line-height:1.3; color:var(--ink);
+}
+.s-roadmap .rc-lim span{
+  display:block; font-weight:400; font-size:12.5px; line-height:1.35;
+  color:var(--greige); margin-top:1px;
+}
+
+/* -- divider -- */
+.s-roadmap .rc-divider{
+  flex-shrink:0; height:3px; background:var(--ink); margin:12px 0; opacity:.15;
+}
+
+/* -- evolve section (bottom half) -- */
+.s-roadmap .rc-evolve{
+  flex:1; display:flex; flex-direction:column; gap:8px;
+}
+.s-roadmap .rc-goal{
+  padding:7px 12px; border-radius:6px;
+  background:rgba(44,76,220,.1); border:2px solid var(--blue);
+  font-family:'Noto Sans SC', sans-serif; font-weight:800;
+  font-size:15px; line-height:1.3; color:var(--blue);
+  margin-bottom:4px;
+}
+.s-roadmap .rc-act{
+  flex:1; padding:7px 12px 5px; border-left:3px solid var(--blue);
+  font-family:'Noto Sans SC', sans-serif;
+}
+.s-roadmap .rc-act strong{
+  display:block; font-weight:600; font-size:16px; line-height:1.3; color:var(--ink);
+}
+.s-roadmap .rc-act span{
+  display:block; font-weight:400; font-size:12.5px; line-height:1.35;
+  color:var(--greige); margin-top:1px;
+}
+
+/* -- footer -- */
+.s-roadmap .rm-foot{
+  flex-shrink:0; height:38px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:16px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.45);
+}
+.s-roadmap .rm-foot .mono{
+  font-family:'DM Mono', monospace; font-size:20px; letter-spacing:.18em;
+}
+
+/* ============ SLIDE: VISION (终极思考) ============ */
+.s-vision{
+  background:var(--cream); display:flex; flex-direction:column;
+}
+.s-vision .topbar{
+  flex-shrink:0; height:80px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'DM Mono', monospace; letter-spacing:.18em; font-size:22px;
+  background:var(--blue); color:var(--cream);
+}
+.s-vision .vis-head{
+  flex-shrink:0; padding:20px 90px 16px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:6px solid var(--ink);
+}
+.s-vision .vis-title{
+  font-family:'Alfa Slab One', serif; font-size:48px; line-height:.9;
+  color:var(--blue); text-shadow:3px 3px 0 var(--red);
+}
+.s-vision .vis-lede{
+  max-width:500px; padding-left:32px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:18px; line-height:1.45; color:var(--ink);
+  border-left:4px solid var(--blue);
+}
+.s-vision .vis-grid{
+  flex:1; min-height:0;
+  display:grid; grid-template-columns:repeat(3, 1fr);
+  padding:0;
+}
+.s-vision .vis-col{
+  padding:24px 36px 20px;
+  border-right:4px solid var(--ink);
+  display:flex; flex-direction:column;
+}
+.s-vision .vis-col:last-child{ border-right:none; }
+.s-vision .vis-col .vc-icon{
+  font-size:36px; margin-bottom:8px;
+}
+.s-vision .vis-col .vc-tag{
+  font-family:'DM Mono', monospace; font-size:12px; letter-spacing:.14em;
+  color:var(--blue); margin-bottom:6px;
+}
+.s-vision .vis-col h3{
+  margin:0 0 6px; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:26px; line-height:1.25; color:var(--ink);
+}
+.s-vision .vis-col .vc-now{
+  margin:0 0 14px; padding:10px 16px; border-radius:8px;
+  background:rgba(44,76,220,.07); border-left:4px solid var(--blue);
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:15px; line-height:1.5; color:var(--ink);
+}
+.s-vision .vis-col .vc-now em{
+  font-style:normal; color:var(--greige); font-size:13px;
+}
+.s-vision .vis-col .vc-arrow{
+  font-family:'DM Mono', monospace; font-size:18px; letter-spacing:.2em;
+  color:var(--red); margin:0 0 10px; text-align:center;
+}
+.s-vision .vis-col .vc-future{
+  padding:14px 16px; border-radius:10px;
+  background:var(--blue-deep); color:var(--cream);
+  font-family:'Noto Sans SC', sans-serif;
+}
+.s-vision .vis-col .vc-future strong{
+  display:block; font-weight:900; font-size:17px; line-height:1.3; margin-bottom:6px;
+  color:var(--orange);
+}
+.s-vision .vis-col .vc-future span{
+  font-weight:500; font-size:14px; line-height:1.5;
+}
+.s-vision .vis-foot{
+  flex-shrink:0; height:54px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 90px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500; font-size:18px;
+  color:var(--ink); border-top:4px solid var(--ink);
+  background:rgba(244,233,214,.45);
+}
+.s-vision .vis-foot .mono{
+  font-family:'DM Mono', monospace; font-size:20px; letter-spacing:.18em;
+}
+
+/* ============ CLOSE ============ */
+.s-close{ background:var(--blue-deep); color:var(--cream);}
+.s-close .frame{ position:absolute; inset:50px; border:6px solid var(--cream);}
+.s-close .top{
+  position:absolute; top:100px; left:100px; right:100px;
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'DM Mono', monospace; letter-spacing:.22em; color:var(--cream); font-size:24px;
+}
+.s-close .center{
+  position:absolute; left:100px; right:100px; top:300px;
+  text-align:center;
+}
+.s-close .center .pre{
+  font-family:'Caveat Brush', cursive; color:var(--orange);
+  font-size:80px; transform:rotate(-3deg); display:inline-block;
+}
+.s-close .center h1{
+  margin:10px 0 0; font-family:'Noto Sans SC', sans-serif; font-weight:900;
+  font-size:160px; line-height:1.1; color:var(--orange);
+  text-shadow: 8px 8px 0 var(--red), 16px 16px 0 var(--red-deep);
+}
+.s-close .center .next-hint{
+  margin-top:50px;
+  font-family:'Noto Sans SC', sans-serif; font-weight:500;
+  font-size:36px; color:var(--cream); letter-spacing:.04em;
+}
+.s-close .footrow{
+  position:absolute; bottom:120px; left:100px; right:100px;
+  display:flex; justify-content:space-between; align-items:flex-end;
+}
+.s-close .signoff{
+  font-family:'DM Mono', monospace; font-size:24px; letter-spacing:.2em; color:var(--cream);
+}
+.s-close .signoff .b{color:var(--orange);}
+.s-close .stamp{
+  width:200px; height:200px; border-radius:50%;
+  background:var(--cream); color:var(--ink);
+  border:4px solid var(--caramel);
+  display:flex; align-items:center; justify-content:center; flex-direction:column;
+  text-align:center; font-family:'Alfa Slab One', serif; line-height:1;
+  transform:rotate(-9deg);
+  box-shadow:6px 6px 0 var(--cognac);
+}
+.s-close .stamp .big{font-size:48px;}
+.s-close .stamp .small{font-size:20px; letter-spacing:.18em; margin-top:8px; font-family:'DM Mono', monospace;}
+
+/* ============ ANIMATIONS — luxury staggered reveal ============ */
+
+/* --- Slide-level crossfade transition --- */
+deck-stage > section {
+  transition: opacity 0.6s cubic-bezier(.4,0,.2,1);
+}
+
+/* --- Animatable elements: initial hidden state --- */
+[data-anim] {
+  opacity: 0;
+  transform: translateY(28px);
+  transition: opacity 0.7s cubic-bezier(.16,1,.3,1),
+              transform 0.7s cubic-bezier(.16,1,.3,1);
+  will-change: opacity, transform;
+}
+
+/* Scale-up variant for big hero text */
+[data-anim="scale"] {
+  opacity: 0;
+  transform: scale(0.92);
+  transition: opacity 0.8s cubic-bezier(.16,1,.3,1),
+              transform 0.8s cubic-bezier(.16,1,.3,1);
+}
+/* Scale variant for elements with existing translate (e.g. venn-overlap) */
+.venn-overlap[data-anim="scale"] {
+  opacity: 0;
+  transform: translate(-50%,-50%) scale(0.85);
+}
+
+/* Fade-only variant for subtle elements */
+[data-anim="fade"] {
+  opacity: 0;
+  transform: none;
+  transition: opacity 0.9s cubic-bezier(.4,0,.2,1);
+}
+
+/* Slide-from-left for Venn circles etc */
+[data-anim="left"] {
+  opacity: 0;
+  transform: translateX(-40px);
+  transition: opacity 0.7s cubic-bezier(.16,1,.3,1),
+              transform 0.7s cubic-bezier(.16,1,.3,1);
+}
+[data-anim="right"] {
+  opacity: 0;
+  transform: translateX(40px);
+  transition: opacity 0.7s cubic-bezier(.16,1,.3,1),
+              transform 0.7s cubic-bezier(.16,1,.3,1);
+}
+
+/* Revealed state */
+[data-anim].revealed {
+  opacity: 1;
+  transform: translateY(0) translateX(0) scale(1);
+}
+/* Preserve original transform for elements that have their own positioning transform */
+.venn-overlap[data-anim].revealed {
+  transform: translate(-50%,-50%) scale(1);
+}
+
+/* Stagger delays via CSS custom property */
+[data-anim] { transition-delay: calc(var(--d, 0) * 1ms); }
+
+/* Border frame draw-in for cover/close/dividers */
+.s-cover .frame,
+.s-part2 .frame,
+.s-part3 .frame,
+.s-close .frame {
+  clip-path: inset(0 100% 100% 0);
+  transition: clip-path 1.2s cubic-bezier(.4,0,.2,1) 0.15s;
+}
+[data-deck-active] .frame-revealed,
+.frame-revealed {
+  clip-path: inset(0 0 0 0) !important;
+}
+
+/* Dot pulse for cover */
+.s-cover .dot {
+  animation: none;
+}
+[data-deck-active].s-cover .dot {
+  animation: dot-pulse 2s ease-in-out 1.6s infinite;
+}
+@keyframes dot-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.4); opacity: 0.6; }
+}
+
+/* Gentle float for "for" script text */
+@keyframes gentle-float {
+  0%, 100% { transform: rotate(-5deg) translateY(0); }
+  50% { transform: rotate(-5deg) translateY(-6px); }
+}
+[data-deck-active].s-cover .for {
+  animation: gentle-float 4s ease-in-out 1.8s infinite;
+}
+
+/* Venn circle subtle breathe */
+@keyframes venn-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.015); }
+}
+[data-deck-active].s-manifesto .venn-circle {
+  animation: venn-breathe 5s ease-in-out 1.5s infinite;
+}
+
+/* Infra chips wave */
+.arch-infra .infra-chip {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+.arch-infra .infra-chip.chip-revealed {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+</style>
+</head>
+<body>
+
+<script type="application/json" id="speaker-notes">
+[
+  "封面页：高招工具包用 AI Skill 重新定义高管招聘效率（页脚年份 2026）。",
+  "核心问题：Skill = Human Intuition × Pattern Matching；× 表示两者缺一不可，维恩图 ∩ 表示匹配落在交集带。",
+  "三大关键步骤：需求识别（脑力活）、市场对标（体力活）、反馈矫正（脑力活）的迭代闭环。",
+  "Pattern Matching 痛点：进入陌生领域的信息获取成本 + 通话里的一手信息沉淀碎片化；后者对下一轮匹配而言等于可用输入噪声大、难结构化复用。",
+  "Human Intuition / Sourcing：追问情境化判断力能否被 Agent Skill 浮现，搜判链路能否人机分工；与 Pattern Matching 输入端并列的另一条主线。",
+  "Part 2 分隔页：进入第二部分，整体设计思路。",
+  "架构图：Part 1 一条是 PM 输入端多点瓶颈，一条是 HI/Sourcing 追问——三条线承接落地；Benchmark 侧重信息获取并为判断提供 Tier，Interview 解决碎片化沉淀，Research 同时补两边。底座五条共享能力大白话。",
+  "Benchmark 搜人全流程：四步走——搞清楚行业→在简历库搜人→候选人进表格→经验沉淀；页脚强调流水线自动跑完、排序与是否推进仍以人为准，避免与『人机分工』打架。",
+  "Benchmark 应用效果：以「美团外卖 履约业务 区域策略运营 L7」为例——一句话启动后 Job Brief（8 道问卷）生成搜索策略；覆盖 10 家即配公司、60+ 条简历经硬筛与 AI 评分；8 位候选人通过质量门（强推荐≥80 分）。详细见页脚学城链接。",
+  "Interview 录音转录流程：三步走——丢录音进来→按模板结构化→自动发到学城（页脚强调全自动流水线，用人决策仍在人）。设计理念：丢录音、选模板、出链接，对话框不刷屏。",
+  "Interview 应用效果：长录音全自动处理、结构化文档与脱敏版就绪；7 套模板目前以面试域为主。",
+  "Research 研究报告整合流程：四步走——识别输入→深度分析→三源补充检索→生成报告。原则：检索可在撰写前补证；正文仅允许可追溯来源（含检索结果），禁止无出处推断，每条结论必有出处。",
+  "Research 应用效果：多份研报整合成高保真报告，带时间线、有原文引用、标注置信度，与 Benchmark Tier 分层无缝衔接。",
+  "Part 3 分隔页：进入第三部分，改进方向。",
+  "限制与改进路线图：四列对比——每个 Skill 和共享底座的当前限制 + 对应改进目标和行动。Benchmark 目标稳定性 90%+；Interview 目标 6h+ 录音和 95% 说话人识别；Research 目标篇幅可控和多行业模板；共享底座升级为多模型 Pipeline、多渠道发布、可视化配置+自愈。",
+  "终极思考：跳出工具看工作流本身。Sourcing——从人找人走向 AI 主动狩猎与持续监控；人才信息库——录音 Skill 沉淀候选人信息，终局 360° 评价；信息获取——Research 走向情报中枢与预警。愿景页现状表述已改为陈述式，避免口吻过激。",
+  "结尾：高招工具包，用 AI Skill 重新定义高管招聘效率。感谢观看（FIN 2026）。"
+]
+</script>
+
+<deck-stage>
+<!-- ========== SLIDE 1 : COVER ========== -->
+<section class="s-cover grain">
+  <div class="frame"></div>
+  <div class="meta-top" data-anim="fade" style="--d:200">
+    <span class="pill">PART 01</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="center">
+    <div class="title" data-anim="scale" style="--d:400">WHY<br>THIS</div>
+    <div class="cn-subtitle" data-anim style="--d:700">为什么要做这个工具包</div>
+    <div class="row2" data-anim style="--d:950">
+      <span class="for">for</span>
+      <span class="sub">高招工具包 Skill 设计思路</span>
+    </div>
+  </div>
+  <div class="footline" data-anim="fade" style="--d:1200">
+    <span>2026</span>
+    <span class="dot"></span>
+    <span>HIRING &middot; EFFICIENCY &middot; AI</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 2 : MANIFESTO — 维恩图 ========== -->
+<section class="s-manifesto grain">
+  <div class="topbar">
+    <span>01 &mdash; WHY SKILL</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="layout">
+    <div class="left-col">
+      <div class="kicker" data-anim="fade" style="--d:200">// CORE THESIS</div>
+      <div class="headline" data-anim style="--d:400">
+        解决复杂问题的 Skill 是<br>
+        <span class="scriptline">Human Intuition</span> &times;<br>
+        <span class="y">Pattern Matching</span>
+      </div>
+      <div class="desc" data-anim style="--d:700">
+        招聘 = 找到 A&times;B 的交集：候选人的能力意愿（A）与组织需求文化（B）的最佳匹配。公式里的 &times; 强调<b>两者缺一不可</b>；维恩图的 &cap; 表示<b>匹配发生在交集带</b>。<br><br>
+        <b>Human Intuition</b>&mdash;&mdash;不用太多分析，靠肌肉记忆就能做出判断：文化适配、潜力评估、人格洞察。<br>
+        <b>Pattern Matching</b>&mdash;&mdash;用代码和产品解决的高并发、通用型智力场景：行业地图、公司对标、人才流动模式。
+      </div>
+    </div>
+    <div class="right-col">
+      <div class="venn-container">
+        <div class="venn-top-label" data-anim="fade" style="--d:500">A &times; B = best match</div>
+        <div class="venn-circle left" data-anim="left" style="--d:700">
+          <div class="venn-title">人类直觉</div>
+          <div class="venn-en">HUMAN INTUITION</div>
+          <div class="venn-items">文化适配<br>潜力评估<br>人格洞察<br>肌肉记忆判断</div>
+        </div>
+        <div class="venn-circle right" data-anim="right" style="--d:800">
+          <div class="venn-title">模式适配</div>
+          <div class="venn-en">PATTERN MATCHING</div>
+          <div class="venn-items">行业地图<br>公司对标<br>组织架构<br>人才流动</div>
+        </div>
+        <div class="venn-overlap" data-anim="scale" style="--d:1100">
+          <div class="venn-inner">
+            <div class="venn-and">&cap;</div>
+            <div class="venn-andlabel">交集<br>= 最佳匹配</div>
+          </div>
+        </div>
+        <div class="venn-bottom-label" data-anim="fade" style="--d:1300">AI HANDLES RIGHT &bull; HUMANS OWN LEFT</div>
+      </div>
+    </div>
+  </div>
+  <div class="footrow" data-anim="fade" style="--d:1400">
+    <span>&mdash; PART 01</span>
+    <span>02</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 3 : PILLARS — 交付流程 × 体力活/脑力活 ========== -->
+<section class="s-pillars grain">
+  <div class="head">
+    <h2 data-anim="scale" style="--d:200">3 KEY<br>STEPS</h2>
+    <div class="lede" data-anim style="--d:500">以交付流程为主线，识别出哪些是<br>Pattern Matching&ldquo;体力活&rdquo;、哪些是 Human Intuition&ldquo;脑力活&rdquo;</div>
+  </div>
+  <div class="grid">
+    <div class="col" data-anim style="--d:700">
+      <span class="num">01</span>
+      <span class="tag">DEMAND DECODE</span>
+      <h3>需求识别与翻译</h3>
+      <p>理解业务需要什么样的人，从模糊的岗位 JD 中提炼出真正的&ldquo;人才画像&rdquo;&mdash;&mdash;行业背景、能力模型、文化适配要求</p>
+      <div class="work-type brain"><span class="dot-indicator"></span>脑力活 &middot; HUMAN INTUITION</div>
+    </div>
+    <div class="col alt" data-anim style="--d:900">
+      <span class="num">02</span>
+      <span class="tag">MARKET BENCHMARK</span>
+      <h3>市场对标与摸排</h3>
+      <p>做行业地图、公司排序、组织架构扫描，找到&ldquo;大概率靠谱&rdquo;的候选人池&mdash;&mdash;这是 Pattern Matching 的主战场</p>
+      <div class="work-type muscle"><span class="dot-indicator"></span>体力活 &middot; PATTERN MATCHING</div>
+    </div>
+    <div class="col" data-anim style="--d:1100">
+      <span class="num">03</span>
+      <span class="tag">FEEDBACK LOOP</span>
+      <h3>反馈矫正</h3>
+      <p>面试后快速收集反馈、调整画像、修正搜索方向。每一轮面试都是对&ldquo;需求理解&rdquo;的再校准，然后继续执行 02</p>
+      <div class="work-type brain"><span class="dot-indicator"></span>脑力活 &middot; HUMAN INTUITION</div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 4 : PAIN — Pattern Matching 痛点 ========== -->
+<section class="s-pain-pm grain">
+  <div class="topbar">
+    <span>PAIN POINT &mdash; PATTERN MATCHING</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="pain-head">
+    <div>
+      <div class="venn-badge">
+        <div class="venn-mini">
+          <div class="vm-circle vm-left dim"></div>
+          <div class="vm-circle vm-right active"></div>
+          <div class="vm-overlap"></div>
+        </div>
+        <div class="venn-badge-label">PATTERN MATCHING 侧</div>
+      </div>
+      <div class="pain-title" data-anim="scale" style="--d:300">PAIN<br>POINTS</div>
+    </div>
+    <div class="pain-lede" data-anim style="--d:600">进入陌生领域时，Pattern Matching 的<br><b>输入端</b>面临两大效率瓶颈</div>
+  </div>
+  <div class="pm-grid">
+    <div class="pm-col" data-anim="left" style="--d:800">
+      <span class="pm-num">01</span>
+      <span class="pm-tag">INFO ACQUISITION</span>
+      <h3>信息获取：内部 + 外部对齐</h3>
+      <p>每个新岗位都是一个陌生行业&mdash;&mdash;需要快速对齐<b>内部信息</b>（组织需求、岗位历史、面试反馈）与<b>外部信息</b>（行业地图、公司排序、人才流向），两条线缺一不可，且几乎每次从零拼凑</p>
+      <div class="pm-badge"><span class="dot-indicator"></span>内部 + 外部信息对齐</div>
+    </div>
+    <div class="pm-col" data-anim="right" style="--d:1000">
+      <span class="pm-num">02</span>
+      <span class="pm-tag">FRAGMENTATION</span>
+      <h3>碎片化沉淀：个人化、不可复用</h3>
+      <p>和每位候选人 1&ndash;2 小时的电话聊天，交换行业观点、公司八卦、组织变动&mdash;&mdash;这些一手信息极其珍贵，但沉淀方式过于<b>个人化、碎片化</b>：散落在脑子里、便签里、聊天记录里。对下一轮 Pattern Matching 而言，等于<b>可用输入噪声大、难以结构化复用</b>。</p>
+      <div class="pm-badge"><span class="dot-indicator"></span>个人化 &middot; 碎片化 &middot; 不可复用</div>
+    </div>
+  </div>
+  <div class="pain-foot" data-anim="fade" style="--d:1300">
+    <span>两个痛点指向同一个问题：Pattern Matching 的<b>输入端</b>效率瓶颈</span>
+    <span class="mono">04</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 5 : PAIN — Human Intuition 痛点 ========== -->
+<section class="s-pain-hi grain">
+  <div class="topbar">
+    <span>PAIN POINT &mdash; HUMAN INTUITION</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="pain-head">
+    <div>
+      <div class="venn-badge">
+        <div class="venn-mini">
+          <div class="vm-circle vm-left active"></div>
+          <div class="vm-circle vm-right dim"></div>
+          <div class="vm-overlap"></div>
+        </div>
+        <div class="venn-badge-label">HUMAN INTUITION 侧</div>
+      </div>
+      <div class="pain-title" data-anim="scale" style="--d:300">SOURCING</div>
+    </div>
+    <div class="pain-lede" data-anim style="--d:600">画像有了、地图画好了，<br>然后呢？</div>
+  </div>
+  <div class="hi-body">
+    <div class="hi-question" data-anim style="--d:400">Sourcing 环节如何发掘 <span class="hi-accent">真正优秀</span> 的候选人？</div>
+    <div class="hi-desc" data-anim style="--d:650">难点往往不在「按关键词筛简历」，而在<b>特定组织与岗位语境</b>里，把长期沉淀的<b>业务理解</b>和对<b>人</b>的把握合成一次性的动作&mdash;&mdash;很多 recruiter 靠肌肉记忆完成「搜库 + 一眼定性」。我们想追问的是：这类<b>情境化的判断力</b>，能否经由 <b>Agent Skill</b> 被<b>模仿、被浮现</b>？这条链路，能不能改成<b>人与 AI 大约各担一半</b>的分工，而不是全部压在人的直觉上？</div>
+    <div class="hi-flow" data-anim style="--d:900">
+      <div class="hi-step">搜库（Skill 辅助）</div>
+      <div class="hi-arrow">&rarr;</div>
+      <div class="hi-step highlight">判断（人机各半）</div>
+      <div class="hi-arrow">&rarr;</div>
+      <div class="hi-step">触达</div>
+      <div class="hi-arrow">&rarr;</div>
+      <div class="hi-step">激活</div>
+    </div>
+    <div class="hi-tag" data-anim="fade" style="--d:1150"><span class="dot-indicator"></span>组织语境 &middot; Skill 能否承接判断 &middot; 人机五五分工</div>
+  </div>
+  <div class="pain-foot" data-anim="fade" style="--d:1350">
+    <span>与「信息输入」并列的另一题：情境判断能否被 <b>Skill 化</b>，搜判链路能否<b>人机协同</b>而非单点堆载</span>
+    <span class="mono">05</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 6 : PART 2 DIVIDER ========== -->
+<section class="s-part2 grain">
+  <div class="frame"></div>
+  <div class="part2-top" data-anim="fade" style="--d:200">
+    <span>PART 02 &mdash; 整体设计思路</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="part2-center">
+    <div class="pre" data-anim style="--d:400">now entering...</div>
+    <h1 data-anim="scale" style="--d:650">Part 2</h1>
+    <div class="sub" data-anim style="--d:950">整体设计思路</div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 7 : ARCHITECTURE — 三条线 × 痛点 ========== -->
+<section class="s-arch grain">
+  <div class="topbar">
+    <span>PART 2 &mdash; 整体设计思路</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="arch-head">
+    <div class="arch-title" data-anim="scale" style="--d:200">SOLVE<br>THE PAINS</div>
+    <div class="arch-lede" data-anim style="--d:500">Part 1：一条是 Pattern Matching <b>输入端</b>的多点瓶颈，一条是 Human Intuition / Sourcing 的追问&mdash;&mdash;对应三条业务线落地<br>先把信息与可复用沉淀做扎实；情境判断通过 Benchmark 的评分门与分流逐步演进，而非再加第四条线<br>一个统一入口，说一句话就能启动；三条线各自独立，共享同一套底层能力</div>
+  </div>
+  <div class="arch-diagram">
+    <!-- router -->
+    <div class="arch-router" data-anim style="--d:700">
+      统一入口 &middot; 说需求就自动分配
+      <div class="arch-router-sub">一句话启动，不用选菜单</div>
+    </div>
+    <!-- 3 skill boxes -->
+    <div class="arch-skills">
+      <div class="arch-skill-box" data-anim style="--d:1100">
+        <span class="ask-num">01</span>
+        <span class="ask-tag">BENCHMARK</span>
+        <h3>行业对标候选人搜索</h3>
+        <p>解决<b>信息获取痛点</b>：自动画行业地图、给公司排序、搜出候选人&mdash;&mdash;不用再每次从零拼凑；同时为 Sourcing 判断提供可复核的信号与 Tier，承接「搜库 + 定性」前半段</p>
+      </div>
+      <div class="arch-skill-box alt" data-anim style="--d:1250">
+        <span class="ask-num">02</span>
+        <span class="ask-tag">INTERVIEW</span>
+        <h3>录音转录与结构化记录</h3>
+        <p>解决<b>碎片化沉淀痛点</b>：面试录音丢进来，自动变成结构化文档&mdash;&mdash;不再散落在脑子和便签里</p>
+      </div>
+      <div class="arch-skill-box" data-anim style="--d:1400">
+        <span class="ask-num">03</span>
+        <span class="ask-tag">RESEARCH</span>
+        <h3>行业研究报告整合</h3>
+        <p>同时服务两个痛点：把多份研报整合成一份有时间线、有引用的报告，补充行业认知的同时沉淀成可复用的知识</p>
+      </div>
+    </div>
+    <!-- infra bar -->
+    <div class="arch-infra">
+      <div class="infra-label">共享底座</div>
+      <div class="infra-items">
+        <span class="infra-chip">一份配置三条线通用</span>
+        <span class="infra-chip">出错自动重试</span>
+        <span class="infra-chip">做决定前过自检清单</span>
+        <span class="infra-chip">产出直接发到学城</span>
+        <span class="infra-chip">聊再久也不忘事</span>
+      </div>
+    </div>
+  </div>
+  <div class="arch-foot" data-anim="fade" style="--d:1800">
+    <span>三条业务线 &times; 两大痛点 = <b>整体解决方案</b></span>
+    <span class="mono">07</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 8 : FLOW — Benchmark 执行流程 ========== -->
+<section class="s-flow grain">
+  <div class="topbar">
+    <span>BENCHMARK &mdash; 搜人全流程</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="flow-head">
+    <div class="flow-title" data-anim="scale" style="--d:200">HOW IT<br>WORKS</div>
+    <div class="flow-lede" data-anim style="--d:500">还记得 Part 1 的信息获取痛点吗？<br>Benchmark 就是解决它的&mdash;&mdash;四步走完<br>从&ldquo;搞清楚从哪找人&rdquo;到&ldquo;候选人进表格&rdquo;</div>
+  </div>
+  <div class="flow-grid">
+    <!-- Phase 1 -->
+    <div class="flow-phase" data-anim style="--d:700">
+      <span class="fp-num">01</span>
+      <span class="fp-tag">搞清楚行业长什么样</span>
+      <h3>岗位理解 &amp; 行业地图</h3>
+      <p class="fp-desc">先问清楚需求 &rarr; 画出行业里有哪些公司 &rarr; 给公司分级排序 &rarr; 挑出重点目标公司</p>
+      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 9 同源）：行业地图 / 自检清单">
+        <img src="flow-stills/flow-benchmark-01.jpg" alt="Benchmark 录屏：行业链与 benchmark 文档产出" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：每次从零拼凑</span>
+          AI 分析完会过一遍 6 项自检清单&mdash;&mdash;行业全不全、公司排得对不对&mdash;&mdash;不合格就重来，确保地图画得靠谱
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：分析完就忘了</span>
+          分析完立刻写进学城文档存档，不等后续搜索，趁记忆最清晰时先落盘
+        </div>
+      </div>
+    </div>
+    <!-- Phase 2 -->
+    <div class="flow-phase" data-anim style="--d:900">
+      <span class="fp-num">02</span>
+      <span class="fp-tag">在简历库里搜人</span>
+      <h3>搜索与筛选</h3>
+      <p class="fp-desc">按公司优先级去简历库搜 &rarr; AI 逐份评分 &rarr; 三轮质量复核 &rarr; 不满足硬条件的直接过滤</p>
+      <figure class="fp-still" data-anim="fade" style="--d:980" title="Demo 录屏（slide 9 同源）：Must-have &amp; 搜索阶段">
+        <img src="flow-stills/flow-benchmark-02.jpg" alt="Benchmark 录屏：Must-have 门禁与进入搜索" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：聊久了AI忘事</span>
+          搜索前先把关键条件存成文件，不管对话多长都随时能回看，不会越搜越跑偏
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：搜出来的人不对版</span>
+          每个候选人写入前，先拿第一步定好的条件逐项验证&mdash;&mdash;不满足就不写入
+        </div>
+      </div>
+    </div>
+    <!-- Phase 3 -->
+    <div class="flow-phase" data-anim style="--d:1100">
+      <span class="fp-num">03</span>
+      <span class="fp-tag">候选人写进表格</span>
+      <h3>结构化入库</h3>
+      <p class="fp-desc">统一格式写入学城表格 &rarr; 姓名自动带链接 &rarr; 写完自动验证：行数对不对、信息全不全</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1180" title="Demo 录屏（slide 9 同源）：候选人表 / 写入学城">
+        <img src="flow-stills/flow-benchmark-03.jpg" alt="Benchmark 录屏：多维表格与候选人写入" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：写入出错没人发现</span>
+          写完后自动跑三遍检查&mdash;&mdash;行数对不对、单元格有没有空的、列格式对不对&mdash;&mdash;有错就自动重写
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：产出格式乱七八糟</span>
+          11 列标准表格模板，每次输出都一样整齐&mdash;&mdash;PM 拿到就能直接用，不用再整理
+        </div>
+      </div>
+    </div>
+    <!-- Phase 4 -->
+    <div class="flow-phase" data-anim style="--d:1300">
+      <span class="fp-num">04</span>
+      <span class="fp-tag">经验沉淀与迭代</span>
+      <h3>复盘 &amp; 越搜越准</h3>
+      <p class="fp-desc">输出执行摘要 &rarr; 哪些公司搜到人了、哪些没搜到 &rarr; 经验写回系统 &rarr; 下次更精准</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1380" title="Demo 录屏（slide 9 同源）：交付摘要 / TOP 分层">
+        <img src="flow-stills/flow-benchmark-04.jpg" alt="Benchmark 录屏：全流程完成报告与推荐分层" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：碎片化不可复用</span>
+          搜索中踩过的坑、有效的别名、组织架构变动全部自动存档&mdash;&mdash;下个岗位复用，不重复踩坑
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：多个岗位排队太慢</span>
+          多个岗位可以同时搜&mdash;&mdash;AI 自动拆分任务、各搜各的、最后汇总到一起
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="flow-foot" data-anim="fade" style="--d:1600">
+    <span>四步走完 = 从&ldquo;陌生行业&rdquo;到&ldquo;候选人进表格&rdquo;&mdash;&mdash;搜库、写入、校验由 Skill <b>自动跑完</b>；排序与是否推进仍以人为准</span>
+    <span class="mono">08</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 9 : DEMO — Benchmark 效果 ========== -->
+<section class="s-demo grain">
+  <div class="topbar">
+    <span>BENCHMARK &mdash; 应用效果</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="demo-head">
+    <div class="demo-title" data-anim="scale" style="--d:200">BENCHMARK<br>IN ACTION</div>
+    <div class="demo-lede" data-anim style="--d:500">以&ldquo;美团外卖 履约业务 区域策略运营 L7&rdquo;岗位为例<br>一句话启动 &rarr; Job Brief &rarr; 行业对标 &rarr; 候选人交付<br>覆盖 10 家即配公司，8 位候选人通过质量门</div>
+  </div>
+  <div class="demo-body">
+    <div class="demo-left">
+      <div class="demo-card" data-anim style="--d:700">
+        <span class="card-label">PHASE 0 &mdash; JOB BRIEF</span>
+        <h4>8 道问卷 &rarr; 自动生成搜索策略</h4>
+        <p>业务背景、目标层级、Must-have 硬条件、核心能力、行业经验、软性要求、学历、薪酬&mdash;&mdash;逐项确认后 AI 自主规划搜索路径</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:900">
+        <span class="card-label">COVERAGE</span>
+        <h4>10 家即配行业公司 &middot; 60+ 条简历</h4>
+        <p>饿了么、达达、京东、顺丰同城、滴滴、闪送、货拉拉、UU跑腿、哈啰、抖音&mdash;&mdash;原始 60+ 条简历经 Must-have 硬筛 + AI 6 维度评分</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:1100">
+        <span class="card-label">OUTPUT &mdash; TOP 3</span>
+        <h4>8 位候选人通过质量门 &middot; 强推荐 &ge;80 分</h4>
+        <p>肖平海（82 分）顺丰同城、王竞阳（80 分）每日优鲜、李飞凤（80 分）闪送&mdash;&mdash;姓名可点击跳转简历详情页，直接加岗或安排面试</p>
+      </div>
+    </div>
+    <div class="demo-right">
+      <div class="demo-screen has-video" data-anim="scale" style="--d:1300">
+        <video class="demo-video" src="benchmark-demo-5x.mp4" data-wall-cap="30" muted loop playsinline preload="metadata"></video>
+        <div class="screen-overlay">
+          <div class="screen-icon play-btn">&#9654;</div>
+          <div class="screen-text">点击播放 &middot; 约 30 秒内播完</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="demo-foot" data-anim="fade" style="--d:1500">
+    <span>一句话启动 &rarr; 全自主执行 &rarr; <b>8 位候选人通过质量门</b> &nbsp;&middot;&nbsp; <a href="https://km.sankuai.com/collabpage/2761129831" target="_blank" class="demo-link">查看学城文档 &nearr;</a></span>
+    <span class="mono">09</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 10 : FLOW — Interview 录音转录流程 ========== -->
+<section class="s-interview grain">
+  <div class="topbar">
+    <span>INTERVIEW &mdash; 录音变文档</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="flow-head">
+    <div class="flow-title" data-anim="scale" style="--d:200">DROP &amp;<br>DONE</div>
+    <div class="flow-lede" data-anim style="--d:500">还记得 Part 1 的碎片化沉淀痛点吗？<br>Interview 就是解决它的&mdash;&mdash;丢录音、选模板、出链接<br>中间不废话，全程后台静默执行</div>
+  </div>
+  <div class="flow-grid">
+    <!-- Phase 1 -->
+    <div class="flow-phase" data-anim style="--d:700">
+      <span class="fp-num">01</span>
+      <span class="fp-tag">丢录音进来</span>
+      <h3>音频识别 &amp; 转录</h3>
+      <p class="fp-desc">收到音频附件 &rarr; 自动识别格式（m4a/mp3/wav） &rarr; 本地模型转录 &rarr; 长音频自动分片拼接</p>
+      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 11 同源）：附件与转录进度">
+        <img src="flow-stills/flow-interview-01.jpg" alt="Interview 录屏：音频处理与对话界面" loading="lazy" width="900" height="506" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：手动整理半天</span>
+          两小时面试录音几分钟出结果，用本地模型跑转录，不传外部服务
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：长录音中间断句</span>
+          超过 60 分钟自动分片（20 分钟一片，片间重叠 10 秒），转录完合并去重、验证覆盖率
+        </div>
+      </div>
+    </div>
+    <!-- Phase 2 -->
+    <div class="flow-phase" data-anim style="--d:950">
+      <span class="fp-num">02</span>
+      <span class="fp-tag">按模板结构化</span>
+      <h3>内容整理 &amp; 规范化</h3>
+      <p class="fp-desc">选择模板（7 套可选） &rarr; 行业术语自动标准化 &rarr; 人名对照还原 &rarr; Q&amp;A List 全覆盖</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1030" title="Demo 录屏（slide 11 同源）：结构化输出">
+        <img src="flow-stills/flow-interview-02.jpg" alt="Interview 录屏：结构化模板与正文生成" loading="lazy" width="900" height="506" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：信息散落脑子里</span>
+          不是简单出文字稿，而是按面试/会议/谈薪等模板结构化&mdash;&mdash;该有的板块一个不落
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：口语化听不懂</span>
+          内置术语标准化&mdash;&mdash;&ldquo;小象&rdquo;自动替换为&ldquo;小象超市&rdquo;，&ldquo;kita&rdquo;替换为&ldquo;Keeta&rdquo;
+        </div>
+      </div>
+    </div>
+    <!-- Phase 3 -->
+    <div class="flow-phase" data-anim style="--d:1200">
+      <span class="fp-num">03</span>
+      <span class="fp-tag">自动发到学城</span>
+      <h3>发布 &amp; 存档</h3>
+      <p class="fp-desc">结构化文档自动发布到学城 &rarr; 录音原件上传为附件 &rarr; 对话框只输出一行链接</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1280" title="Demo 录屏（slide 11 同源）：学城链接与交付">
+        <img src="flow-stills/flow-interview-03.jpg" alt="Interview 录屏：发布学城与任务收尾" loading="lazy" width="900" height="506" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：产出散落各处</span>
+          文档直接进学城知识库，录音原件作为附件挂在文档末尾&mdash;&mdash;找的时候一处搞定
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">解决：多个录音排队</span>
+          多个录音文件串行处理，一条处理完接着下一条&mdash;&mdash;全程静默，不在对话框刷屏
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="flow-foot" data-anim="fade" style="--d:1500">
+    <span>丢录音 &rarr; 选模板 &rarr; 出学城链接，<b>全程不废话</b></span>
+    <span class="mono">10</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 11 : DEMO — Interview 效果 ========== -->
+<section class="s-demo grain">
+  <div class="topbar">
+    <span>INTERVIEW &mdash; 应用效果</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="demo-head">
+    <div class="demo-title" data-anim="scale" style="--d:200">INTERVIEW<br>IN ACTION</div>
+    <div class="demo-lede" data-anim style="--d:500">3 小时 46 分钟面试录音 &rarr; 12 分钟全自动处理<br>闪闪模板（G）6 大板块 &middot; 7300+ 字结构化文档<br>自动发布学城 + 大象通知 + 脱敏外部版本</div>
+  </div>
+  <div class="demo-body">
+    <div class="demo-left">
+      <div class="demo-card" data-anim style="--d:700">
+        <span class="card-label">SPEED</span>
+        <h4>3h46m 录音 &rarr; 12 分钟全流程</h4>
+        <p>211MB 音频自动分片（8 段 &times; 30 分钟），逐段转录合并，闪闪模板填充，发布学城 + 大象通知，全程无人工介入</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:900">
+        <span class="card-label">QUALITY</span>
+        <h4>83/100 综合评分 &middot; 有条件推进</h4>
+        <p>6 板块结构化输出：拜访摘要、履历要点、组织架构、Assessment、结构化沉淀（行业观点 7 条 + 人员点评 7 人）、沟通信息摘录</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:1100">
+        <span class="card-label">DESENSITIZED</span>
+        <h4>一键生成脱敏外部展示版</h4>
+        <p>自动隐藏候选人姓名、面试官、具体人名、公司内部组织信息，保留方法论和行业洞察价值。<a href="https://km.sankuai.com/collabpage/2762161154" target="_blank" class="demo-inline-link">查看脱敏版 &rarr;</a></p>
+      </div>
+    </div>
+    <div class="demo-right">
+      <div class="demo-screen" data-anim="scale" style="--d:1300">
+        <video controls autoplay muted loop playsinline style="width:100%;height:100%;object-fit:contain;border-radius:8px;cursor:pointer;">
+          <source src="demo_interview_30s.mp4" type="video/mp4">
+        </video>
+      </div>
+    </div>
+  </div>
+  <div class="demo-foot" data-anim="fade" style="--d:1500">
+    <span>前置仓业务开发负责人【260510】&mdash; <b>录音丢进来，12 分钟后学城文档 + 脱敏版全部就绪</b></span>
+    <span class="mono">11</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 12 : FLOW — Research 研究报告整合流程 ========== -->
+<section class="s-research grain">
+  <div class="topbar">
+    <span>RESEARCH &mdash; 研报变报告</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="flow-head">
+    <div class="flow-title" data-anim="scale" style="--d:200">READ &amp;<br>MERGE</div>
+    <div class="flow-lede" data-anim style="--d:500">多份研报、纪要、专家访谈散落各处？<br>Research 把它们整合成一份带时间线、<br>有原文引用、标注置信度的高保真报告</div>
+  </div>
+  <div class="flow-grid">
+    <!-- Phase 1 -->
+    <div class="flow-phase" data-anim style="--d:700">
+      <span class="fp-num">01</span>
+      <span class="fp-tag">识别所有输入</span>
+      <h3>文档扫描 &amp; 分级</h3>
+      <p class="fp-desc">识别所有输入文档（PDF/Word/Excel/TXT） &rarr; 梳理时间线 &rarr; 来源质量分级（一手 &gt; 二手 &gt; 三手）</p>
+      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 13 同源）：文档输入与任务面板">
+        <img src="flow-stills/flow-research-01.jpg" alt="Research 录屏：多文档输入与进度" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">核心原则：只描述不创作</span>
+          撰写前允许三源检索补证；写入正文时仅允许使用<b>可追溯来源</b>（含上传文档与检索结果），严禁无出处推断或幻觉&mdash;&mdash;每条结论必须有出处
+        </div>
+      </div>
+    </div>
+    <!-- Phase 2 -->
+    <div class="flow-phase" data-anim style="--d:950">
+      <span class="fp-num">02</span>
+      <span class="fp-tag">深度分析内容</span>
+      <h3>术语 &amp; 观点 &amp; 时间线</h3>
+      <p class="fp-desc">专业术语提取 &rarr; 时间线重构 &rarr; 观点演进追踪 &rarr; 争议项标注 &rarr; 置信度分层（HIGH/MED/LOW）</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1030" title="Demo 录屏（slide 13 同源）：分析与提纲">
+        <img src="flow-stills/flow-research-02.jpg" alt="Research 录屏：深度分析与结构化提纲" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：信息碎片化</span>
+          跨文档追踪同一个观点的演进&mdash;&mdash;谁先说的、后来谁修正了、最新结论是什么
+        </div>
+      </div>
+    </div>
+    <!-- Phase 3 -->
+    <div class="flow-phase" data-anim style="--d:1200">
+      <span class="fp-num">03</span>
+      <span class="fp-tag">三源补充检索</span>
+      <h3>本地 + 网络 + 学城</h3>
+      <p class="fp-desc">动笔前强制三路检索：本地研究库 grep &rarr; web_search 搜公开信息 &rarr; 学城搜已有文档</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1280" title="Demo 录屏（slide 13 同源）：检索与引用">
+        <img src="flow-stills/flow-research-03.jpg" alt="Research 录屏：三源检索与引用轨迹" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：信息不全就动笔</span>
+          动笔前列出检索清单：三源全部跑完后再进入撰写；检索到的材料仅作引用素材，仍须满足上一阶段的「可追溯」约束
+        </div>
+      </div>
+    </div>
+    <!-- Phase 4 -->
+    <div class="flow-phase" data-anim style="--d:1450">
+      <span class="fp-num">04</span>
+      <span class="fp-tag">生成高保真报告</span>
+      <h3>撰写 &amp; 发布</h3>
+      <p class="fp-desc">按模板生成报告 &rarr; 末尾列出信息缺口地图 &rarr; 发布到学城 &rarr; 可衔接 Benchmark 的 Tier 分层</p>
+      <figure class="fp-still" data-anim="fade" style="--d:1530" title="Demo 录屏（slide 13 同源）：成稿与发布">
+        <img src="flow-stills/flow-research-04.jpg" alt="Research 录屏：报告生成与学城发布" loading="lazy" width="800" height="450" />
+      </figure>
+      <div class="fp-details">
+        <div class="fp-detail">
+          <span class="detail-label">解决：报告写完没下文</span>
+          如果与招聘相关，自动生成招聘洞察层&mdash;&mdash;行业人才格局、候选人画像推导、面试验证建议
+        </div>
+        <div class="fp-detail">
+          <span class="detail-label">三种输出模式</span>
+          标准模式（按时间线）、竞品分析模式（横向对比）、快速摘要模式（精简版）
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="flow-foot" data-anim="fade" style="--d:1700">
+    <span>多份散碎输入 &rarr; 先检索补证、再落笔定稿；正文<b>只引用可追溯来源</b>，只描述不创作</span>
+    <span class="mono">12</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 13 : DEMO — Research 效果 ========== -->
+<section class="s-demo grain">
+  <div class="topbar">
+    <span>RESEARCH &mdash; 应用效果</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="demo-head">
+    <div class="demo-title" data-anim="scale" style="--d:200">RESEARCH<br>IN ACTION</div>
+    <div class="demo-lede" data-anim style="--d:500">20 份研报/纪要/专家访谈 &rarr; 8 分 46 秒全自动处理<br>产业叙事线 &times; 观点矩阵法 &middot; 四章结构 &middot; 万字深度报告<br>自动发布学城 + 大象通知 + 三源补充检索</div>
+  </div>
+  <div class="demo-body">
+    <div class="demo-left">
+      <div class="demo-card" data-anim style="--d:700">
+        <span class="card-label">SCALE</span>
+        <h4>20 份文档 &rarr; 万字报告 &middot; 8m46s</h4>
+        <p>高盛/伯恩斯坦/摩根士丹利研报 + 字节/阿里专家纪要 + Token经济学深访 + 卓哥研讨群周报，PDF &amp; DOCX 混合输入，全程零人工介入</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:900">
+        <span class="card-label">DEPTH</span>
+        <h4>产业链四层 &times; 观点矩阵</h4>
+        <p>算力芯片 &rarr; 基础设施 &rarr; 模型 &rarr; 应用，跨 20 份材料追踪共识与分歧（如CapEx ROI验证窗口、Token定价三拐点），风险矩阵5维度量化评估</p>
+      </div>
+      <div class="demo-card" data-anim style="--d:1100">
+        <span class="card-label">OUTPUT</span>
+        <h4>学城发布 + 大象推送 + Web补充检索</h4>
+        <p>自动执行三源检索（本地研报库 + Web + 学城）补充最新数据，生成四章结构报告发布至学城父文档下，并推送大象通知。<a href="https://km.sankuai.com/collabpage/2762271284" target="_blank" class="demo-inline-link">查看报告 &rarr;</a></p>
+      </div>
+    </div>
+    <div class="demo-right">
+      <div class="demo-screen has-video" data-anim="scale" style="--d:1300">
+        <video class="demo-video" src="demo_research_30s.mp4" muted loop playsinline preload="metadata"></video>
+      </div>
+    </div>
+  </div>
+  <div class="demo-foot" data-anim="fade" style="--d:1500">
+    <span>AI产业深度研究【260512】&mdash; <b>20 份散碎输入，8 分钟后万字报告 + 学城发布全部就绪</b></span>
+    <span class="mono">13</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 14 : PART 3 DIVIDER ========== -->
+<section class="s-part3 grain">
+  <div class="frame"></div>
+  <div class="part3-top" data-anim="fade" style="--d:200">
+    <span>PART 03 &mdash; 改进方向</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="part3-center">
+    <div class="pre" data-anim style="--d:400">what's next...</div>
+    <h1 data-anim="scale" style="--d:650">Part 3</h1>
+    <div class="sub" data-anim style="--d:950">改进方向</div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 15 : ROADMAP — 限制 & 改进 ========== -->
+<section class="s-roadmap grain">
+  <div class="topbar">
+    <span>ROADMAP &mdash; 限制 &amp; 改进</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="rm-head">
+    <div class="rm-title" data-anim="scale" style="--d:200">LIMITS<br>&amp; NEXT</div>
+    <div class="rm-lede" data-anim style="--d:400">看清限制 &rarr; 明确目标 &rarr; 拆解行动<br>每个 Skill 和共享底座的改进路线图</div>
+  </div>
+  <div class="rm-grid">
+    <!-- Col 1: Benchmark -->
+    <div class="rm-col" data-anim style="--d:600">
+      <div class="rc-tag">BENCHMARK</div>
+      <div class="rc-name">行业对标搜索</div>
+      <div class="rc-section-label">&#9888; LIMITS</div>
+      <div class="rc-limits">
+        <div class="rc-lim"><strong>云豹 CLI 字段缺失</strong><span>搜索结果缺少关键信息，需二次查询补全</span></div>
+        <div class="rc-lim"><strong>上下文膨胀 &rarr; 幻觉</strong><span>候选人过多时 token 溢出，评估质量下降</span></div>
+        <div class="rc-lim"><strong>行业地图依赖人工</strong><span>目标公司清单仍需 HR 手工维护，无法自动发现</span></div>
+      </div>
+      <div class="rc-divider"></div>
+      <div class="rc-section-label">&#127919; NEXT</div>
+      <div class="rc-goal">稳定性 60% &rarr; 90%+</div>
+      <div class="rc-evolve">
+        <div class="rc-act"><strong>接入候选人详情 API</strong><span>绕过 CLI 限制，直取结构化字段</span></div>
+        <div class="rc-act"><strong>分批评估 + 结果合并</strong><span>将候选人分片处理，消除上下文膨胀</span></div>
+        <div class="rc-act"><strong>自动化 Org Map 构建</strong><span>用公开数据自动生成行业对标地图</span></div>
+      </div>
+    </div>
+    <!-- Col 2: Interview -->
+    <div class="rm-col" data-anim style="--d:850">
+      <div class="rc-tag">INTERVIEW</div>
+      <div class="rc-name">面试录音转录</div>
+      <div class="rc-section-label">&#9888; LIMITS</div>
+      <div class="rc-limits">
+        <div class="rc-lim"><strong>GPU / VRAM 瓶颈</strong><span>超长录音加载时 GPU 显存不足，需降级模型</span></div>
+        <div class="rc-lim"><strong>说话人分离精度有限</strong><span>多人同时说话时分离错误率偏高</span></div>
+        <div class="rc-lim"><strong>模板场景纵深不足</strong><span>现有 7 套均以面试域为主，谈薪/BP 等场景覆盖仍弱</span></div>
+      </div>
+      <div class="rc-divider"></div>
+      <div class="rc-section-label">&#127919; NEXT</div>
+      <div class="rc-goal">6h+ 录音、说话人 95%+</div>
+      <div class="rc-evolve">
+        <div class="rc-act"><strong>流式分片 + 并行转录</strong><span>长录音切片后多线程处理，突破时长限制</span></div>
+        <div class="rc-act"><strong>声纹预注册</strong><span>面试前录入声纹，大幅提升说话人识别</span></div>
+        <div class="rc-act"><strong>模板工厂</strong><span>可配置多场景模板，覆盖谈薪/BP 沟通等</span></div>
+      </div>
+    </div>
+    <!-- Col 3: Research -->
+    <div class="rm-col" data-anim style="--d:1100">
+      <div class="rc-tag">RESEARCH</div>
+      <div class="rc-name">研报整合分析</div>
+      <div class="rc-section-label">&#9888; LIMITS</div>
+      <div class="rc-limits">
+        <div class="rc-lim"><strong>输出长度方差大</strong><span>同类研报的摘要长度波动 3-10 倍</span></div>
+        <div class="rc-lim"><strong>模板种类少</strong><span>仅通用格式，缺少行业/职能专属模板</span></div>
+        <div class="rc-lim"><strong>数据新鲜度受限</strong><span>依赖手动上传研报，无法自动获取最新数据</span></div>
+      </div>
+      <div class="rc-divider"></div>
+      <div class="rc-section-label">&#127919; NEXT</div>
+      <div class="rc-goal">篇幅可控、多行业模板</div>
+      <div class="rc-evolve">
+        <div class="rc-act"><strong>篇幅控制器</strong><span>设定字数区间，输出长度一致可控</span></div>
+        <div class="rc-act"><strong>行业模板库</strong><span>按行业/职能预置模板，开箱即用</span></div>
+        <div class="rc-act"><strong>付费源接入</strong><span>对接 Wind/Bloomberg 等，自动拉取最新数据</span></div>
+      </div>
+    </div>
+    <!-- Col 4: 共享底座 -->
+    <div class="rm-col" data-anim style="--d:1350">
+      <div class="rc-tag">SHARED INFRA</div>
+      <div class="rc-name">共享底座</div>
+      <div class="rc-section-label">&#9888; LIMITS</div>
+      <div class="rc-limits">
+        <div class="rc-lim"><strong>单一上下文窗口依赖</strong><span>所有推理挤在一个窗口，互相干扰</span></div>
+        <div class="rc-lim"><strong>学城 API 单一输出</strong><span>仅支持学城文档，无法直接输出到大象/邮件</span></div>
+        <div class="rc-lim"><strong>配置手动 &amp; 恢复有限</strong><span>Skill 配置全靠手动，出错后难以回滚</span></div>
+      </div>
+      <div class="rc-divider"></div>
+      <div class="rc-section-label">&#127919; NEXT</div>
+      <div class="rc-goal">多模型、多通道、零代码</div>
+      <div class="rc-evolve">
+        <div class="rc-act"><strong>多模型 Pipeline</strong><span>不同任务调度最优模型，成本与质量兼顾</span></div>
+        <div class="rc-act"><strong>多渠道发布</strong><span>一键输出到学城/大象/邮件/NoCode</span></div>
+        <div class="rc-act"><strong>可视化配置 + 自愈</strong><span>零代码面板管理 Skill，异常自动恢复</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="rm-foot" data-anim="fade" style="--d:1600">
+    <span>限制 &rarr; 目标 &rarr; 行动 = <b>结构化的改进路径</b></span>
+    <span class="mono">15</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 16 : VISION — 终极思考 ========== -->
+<section class="s-vision grain">
+  <div class="topbar">
+    <span>VISION &mdash; 更大的思考</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="vis-head">
+    <div class="vis-title" data-anim="scale" style="--d:200">BIGGER<br>PICTURE</div>
+    <div class="vis-lede" data-anim style="--d:500">跳出工具看工作流本身<br>AI 不只是提效工具<br>它在重塑招聘的底层逻辑</div>
+  </div>
+  <div class="vis-grid">
+    <!-- Col 1: Sourcing 重塑 -->
+    <div class="vis-col" data-anim style="--d:700">
+      <div class="vc-icon">&#128270;</div>
+      <div class="vc-tag">SOURCING</div>
+      <h3>候选人寻访</h3>
+      <div class="vc-now">
+        <em>// 现状</em><br>
+        招聘很重的一块仍是多渠道扫简历、翻列表：LinkedIn 翻 100 页、猎聘筛 200 条、脉脉加 50 人&mdash;&mdash;大量重复劳动挤占本该用于判断与对话的时间。
+      </div>
+      <div class="vc-arrow">&darr;&darr;&darr;</div>
+      <div class="vc-future">
+        <strong>AI 主动狩猎</strong>
+        <span>Benchmark Skill 的终局不是&ldquo;帮你搜得更快&rdquo;，而是&ldquo;你只需要定义岗位画像，AI 自动完成行业扫描、候选人发现、Tier 评级、持续监控&rdquo;&mdash;&mdash;从人找人变成机器养鱼塘。</span>
+      </div>
+    </div>
+    <!-- Col 2: 人才信息库 -->
+    <div class="vis-col" data-anim style="--d:1000">
+      <div class="vc-icon">&#128100;</div>
+      <div class="vc-tag">TALENT DATABASE</div>
+      <h3>人才信息沉淀</h3>
+      <div class="vc-now">
+        <em>// 现状</em><br>
+        录音 Skill 本质上在做基于每个候选人的信息化沉淀。但现在这些信息是散落的&mdash;&mdash;一份学城文档、一个面试评价、一段录音摘要，没有被串联起来。
+      </div>
+      <div class="vc-arrow">&darr;&darr;&darr;</div>
+      <div class="vc-future">
+        <strong>候选人 360&deg; 评价体系</strong>
+        <span>每次面试、每次沟通、每份背调都自动汇入候选人档案。多轮面试官的评价交叉验证，形成动态更新的 360&deg; 人才画像&mdash;&mdash;不再是一次性判断，而是持续迭代的认知。</span>
+      </div>
+    </div>
+    <!-- Col 3: 信息获取 -->
+    <div class="vis-col" data-anim style="--d:1300">
+      <div class="vc-icon">&#127758;</div>
+      <div class="vc-tag">INFORMATION</div>
+      <h3>信息获取方式</h3>
+      <div class="vc-now">
+        <em>// 现状</em><br>
+        行业研究报告整合，本质上在解决&ldquo;如何更有效地获取信息&rdquo;。但 20 份研报只是冰山一角&mdash;&mdash;更多的信息在专家脑子里、在非公开渠道里、在实时变化中。
+      </div>
+      <div class="vc-arrow">&darr;&darr;&darr;</div>
+      <div class="vc-future">
+        <strong>信息获取的范式转移</strong>
+        <span>Research Skill 的终局是成为招聘团队的&ldquo;情报中枢&rdquo;&mdash;&mdash;自动追踪目标公司人事变动、行业政策风向、竞对组织架构调整，从被动整合变为主动监控预警。</span>
+      </div>
+    </div>
+  </div>
+  <div class="vis-foot" data-anim="fade" style="--d:1600">
+    <span>工具在提效，但更重要的是 <b>它在改变我们思考招聘的方式</b></span>
+<span class="mono">16</span>
+</div>
+</section>
+
+<!-- ========== SLIDE 17 : CLOSE ========== -->
+<section class="s-close grain">
+  <div class="frame"></div>
+  <div class="top" data-anim="fade" style="--d:200">
+    <span>THANK YOU</span>
+    <span>SENIOR HIRING TOOLKIT</span>
+  </div>
+  <div class="center">
+    <div class="pre" data-anim style="--d:400">that's a wrap</div>
+    <h1 data-anim="scale" style="--d:650">End</h1>
+    <div class="next-hint" data-anim style="--d:950">高招工具包 &middot; 用 AI Skill 重新定义高管招聘效率</div>
+  </div>
+  <div class="footrow" data-anim="fade" style="--d:1200">
+    <div class="signoff">
+      BUILT WITH <span class="b">AI</span> &bull; POWERED BY <span class="b">PEOPLE</span>
+    </div>
+    <div class="stamp" data-anim="scale" style="--d:1400">
+      <span class="big">FIN</span>
+      <span class="small">2026</span>
+    </div>
+  </div>
+</section>
+
+</deck-stage>
+
+<script>
+(() => {
+  const deck = document.querySelector('deck-stage');
+  if (!deck) return;
+
+  // Reset all animations in a slide (remove .revealed)
+  function resetSlide(slide) {
+    if (!slide) return;
+    slide.querySelectorAll('[data-anim]').forEach(el => {
+      el.classList.remove('revealed');
+    });
+    // Reset frame draw-in
+    slide.querySelectorAll('.frame').forEach(f => f.classList.remove('frame-revealed'));
+    // Reset infra chips
+    slide.querySelectorAll('.arch-infra .infra-chip').forEach(c => c.classList.remove('chip-revealed'));
+  }
+
+  // Reveal animations in a slide with stagger
+  function revealSlide(slide) {
+    if (!slide) return;
+
+    // Reveal data-anim elements
+    const anims = slide.querySelectorAll('[data-anim]');
+    anims.forEach(el => {
+      const delay = parseInt(getComputedStyle(el).getPropertyValue('--d')) || 0;
+      setTimeout(() => el.classList.add('revealed'), delay);
+    });
+
+    // Frame draw-in (for cover / part2 / close)
+    const frame = slide.querySelector('.frame');
+    if (frame) {
+      setTimeout(() => frame.classList.add('frame-revealed'), 150);
+    }
+
+    // Infra chips wave
+    const chips = slide.querySelectorAll('.arch-infra .infra-chip');
+    if (chips.length) {
+      chips.forEach((c, i) => {
+        setTimeout(() => c.classList.add('chip-revealed'), 1600 + i * 120);
+      });
+    }
+  }
+
+  // Listen for slide changes
+  deck.addEventListener('slidechange', (e) => {
+    const { slide, previousSlide, reason } = e.detail;
+
+    // Reset previous slide
+    if (previousSlide && previousSlide !== slide) {
+      resetSlide(previousSlide);
+    }
+
+    // Reveal current slide
+    // Small delay to let the deck's own opacity transition start
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        revealSlide(slide);
+      });
+    });
+  });
+
+  // Handle initial load — the slidechange 'init' event fires before this
+  // script runs, so we need to manually reveal the first active slide.
+  const initialSlide = deck.querySelector('[data-deck-active]');
+  if (initialSlide) {
+    // Short delay so the browser has painted the hidden state first,
+    // then we transition to visible — gives the nice entrance feel.
+    setTimeout(() => revealSlide(initialSlide), 80);
+  }
+
+  // --- Demo videos: optional wall-clock cap (e.g. Benchmark slide ≤30s) ---
+  const PLAYBACK_RATE_CEILING = 16;
+  document.querySelectorAll('video.demo-video[data-wall-cap]').forEach(video => {
+    const capSec = parseFloat(video.getAttribute('data-wall-cap'), 10) || 30;
+    function applyWallCap() {
+      const d = video.duration;
+      if (!d || !Number.isFinite(d)) return;
+      if (d <= capSec) {
+        video.playbackRate = 1;
+      } else {
+        video.playbackRate = Math.min(PLAYBACK_RATE_CEILING, d / capSec);
+      }
+    }
+    video.addEventListener('loadedmetadata', applyWallCap);
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) applyWallCap();
+  });
+
+  // --- Video play/pause toggle ---
+  document.querySelectorAll('.demo-screen.has-video').forEach(screen => {
+    const video = screen.querySelector('video');
+    if (!video) return;
+    screen.addEventListener('click', () => {
+      if (video.paused) {
+        video.play();
+        screen.classList.add('playing');
+      } else {
+        video.pause();
+        screen.classList.remove('playing');
+      }
+    });
+  });
+
+  // Pause all videos when navigating away from a slide
+  deck.addEventListener('slidechange', (e) => {
+    const prev = e.detail.previousSlide;
+    if (prev) {
+      prev.querySelectorAll('video').forEach(v => {
+        v.pause();
+        v.currentTime = 0;
+      });
+      prev.querySelectorAll('.demo-screen.playing').forEach(s => s.classList.remove('playing'));
+    }
+  });
+})();
+</script>
+
+<script>
+(() => {
+  const lb = document.createElement('div');
+  lb.className = 'flow-img-lightbox';
+  lb.setAttribute('role', 'dialog');
+  lb.setAttribute('aria-modal', 'true');
+  lb.setAttribute('aria-hidden', 'true');
+  lb.innerHTML = '<button type="button" class="flow-img-lightbox-close" aria-label="关闭放大预览">&times;</button><img alt="" decoding="async" />';
+  document.body.appendChild(lb);
+  const lbImg = lb.querySelector('img');
+  const btnClose = lb.querySelector('.flow-img-lightbox-close');
+
+  function closeLb() {
+    lb.classList.remove('open');
+    lb.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+    lbImg.removeAttribute('src');
+  }
+
+  function openLb(thumb) {
+    lbImg.src = thumb.currentSrc || thumb.src;
+    lbImg.alt = thumb.getAttribute('alt') || '';
+    lb.classList.add('open');
+    lb.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+    btnClose.focus({ preventScroll: true });
+  }
+
+  lb.addEventListener('click', (e) => {
+    if (e.target === lb || e.target === btnClose) closeLb();
+  });
+  lbImg.addEventListener('click', (e) => e.stopPropagation());
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && lb.classList.contains('open')) {
+      e.preventDefault();
+      closeLb();
+    }
+  });
+
+  document.querySelectorAll('.flow-phase .fp-still img').forEach((img) => {
+    img.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openLb(img);
+    });
+  });
+
+  const deck = document.querySelector('deck-stage');
+  if (deck) {
+    deck.addEventListener('slidechange', () => {
+      if (lb.classList.contains('open')) closeLb();
+    });
+  }
+})();
+</script>
+
+</body>
+</html>
