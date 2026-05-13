@@ -1336,6 +1336,68 @@ deck-stage > section{
   cursor:zoom-in;
 }
 
+/* 截图/视频占位块 */
+.fp-still-placeholder{
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  padding:10px 12px;
+  background:rgba(14,14,20,.06);
+  border:1.5px dashed rgba(14,14,20,.22);
+  gap:4px;
+}
+.fp-still-placeholder span{
+  font-size:11px;
+  font-weight:600;
+  color:rgba(14,14,20,.55);
+  letter-spacing:.02em;
+}
+.fp-still-placeholder p{
+  margin:0;
+  font-size:10px;
+  line-height:1.5;
+  color:rgba(14,14,20,.45);
+}
+
+/* 视频区域占位块 */
+.demo-screen-placeholder{
+  background:rgba(14,14,20,.06) !important;
+  border:1.5px dashed rgba(14,14,20,.22) !important;
+  display:flex !important;
+  align-items:center;
+  justify-content:center;
+}
+.placeholder-inner{
+  text-align:center;
+  padding:24px 20px;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:8px;
+}
+.placeholder-icon{
+  font-size:28px;
+  opacity:.3;
+}
+.placeholder-title{
+  font-size:14px;
+  font-weight:700;
+  color:rgba(14,14,20,.5);
+  letter-spacing:.04em;
+}
+.placeholder-desc{
+  font-size:11px;
+  line-height:1.6;
+  color:rgba(14,14,20,.4);
+  max-width:320px;
+}
+.placeholder-note{
+  font-size:10px;
+  color:rgba(14,14,20,.3);
+  font-style:italic;
+  margin-top:4px;
+}
+
 /* Flow slide stills — click-to-zoom lightbox */
 .flow-img-lightbox{
   position:fixed;
@@ -2388,9 +2450,10 @@ deck-stage > section {
       <span class="fp-tag">搞清楚行业长什么样</span>
       <h3>岗位理解 &amp; 行业地图</h3>
       <p class="fp-desc">先问清楚需求 &rarr; 画出行业里有哪些公司 &rarr; 给公司分级排序 &rarr; 挑出重点目标公司</p>
-      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 9 同源）：行业地图 / 自检清单">
-        <img src="flow-stills/flow-benchmark-01.jpg" alt="Benchmark 录屏：行业链与 benchmark 文档产出" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:780">
+        <span>📋 行业地图 &amp; 自检清单产出示意</span>
+        <p>AI 分析行业链 → 输出公司分级列表 → 六项自检清单验证完整性 → 写入学城文档存档</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：每次从零拼凑</span>
@@ -2408,9 +2471,10 @@ deck-stage > section {
       <span class="fp-tag">在简历库里搜人</span>
       <h3>搜索与筛选</h3>
       <p class="fp-desc">按公司优先级去简历库搜 &rarr; AI 逐份评分 &rarr; 三轮质量复核 &rarr; 不满足硬条件的直接过滤</p>
-      <figure class="fp-still" data-anim="fade" style="--d:980" title="Demo 录屏（slide 9 同源）：Must-have &amp; 搜索阶段">
-        <img src="flow-stills/flow-benchmark-02.jpg" alt="Benchmark 录屏：Must-have 门禁与进入搜索" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:980">
+        <span>🔍 Must-have 门禁 &amp; 搜索阶段示意</span>
+        <p>按公司优先级逐家搜库 → Must-have 条件逐项核验 → 不达标直接过滤 → AI 六维评分</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：聊久了AI忘事</span>
@@ -2428,9 +2492,10 @@ deck-stage > section {
       <span class="fp-tag">候选人写进表格</span>
       <h3>结构化入库</h3>
       <p class="fp-desc">统一格式写入学城表格 &rarr; 姓名自动带链接 &rarr; 写完自动验证：行数对不对、信息全不全</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1180" title="Demo 录屏（slide 9 同源）：候选人表 / 写入学城">
-        <img src="flow-stills/flow-benchmark-03.jpg" alt="Benchmark 录屏：多维表格与候选人写入" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1180">
+        <span>📊 多维表格写入示意</span>
+        <p>11 列标准格式写入学城多维表格 → 姓名自动带简历链接 → 写完三轮自动验证行数与字段完整性</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：写入出错没人发现</span>
@@ -2448,9 +2513,10 @@ deck-stage > section {
       <span class="fp-tag">经验沉淀与迭代</span>
       <h3>复盘 &amp; 越搜越准</h3>
       <p class="fp-desc">输出执行摘要 &rarr; 哪些公司搜到人了、哪些没搜到 &rarr; 经验写回系统 &rarr; 下次更精准</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1380" title="Demo 录屏（slide 9 同源）：交付摘要 / TOP 分层">
-        <img src="flow-stills/flow-benchmark-04.jpg" alt="Benchmark 录屏：全流程完成报告与推荐分层" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1380">
+        <span>📈 交付摘要 &amp; 推荐分层示意</span>
+        <p>强推荐 ≥80 / 可考虑 60–79 / 存档 &lt;60 三层分级 → 踩坑记录与有效别名自动存档 → 下次复用</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：碎片化不可复用</span>
@@ -2498,11 +2564,12 @@ deck-stage > section {
       </div>
     </div>
     <div class="demo-right">
-      <div class="demo-screen has-video" data-anim="scale" style="--d:1300">
-        <video class="demo-video" src="benchmark-demo-5x.mp4" data-wall-cap="30" muted loop playsinline preload="metadata"></video>
-        <div class="screen-overlay">
-          <div class="screen-icon play-btn">&#9654;</div>
-          <div class="screen-text">点击播放 &middot; 约 30 秒内播完</div>
+      <div class="demo-screen demo-screen-placeholder" data-anim="scale" style="--d:1300">
+        <div class="placeholder-inner">
+          <div class="placeholder-icon">▶</div>
+          <div class="placeholder-title">Benchmark Demo 录屏</div>
+          <div class="placeholder-desc">一句话启动 → Job Brief 问卷 → 行业地图 → 搜库评分 → 候选人写入学城表格<br>全程约 5 分钟，视频为 5× 加速版（约 30 秒）</div>
+          <div class="placeholder-note">演示视频仅供内部参考，未随文档公开发布</div>
         </div>
       </div>
     </div>
@@ -2530,9 +2597,10 @@ deck-stage > section {
       <span class="fp-tag">丢录音进来</span>
       <h3>音频识别 &amp; 转录</h3>
       <p class="fp-desc">收到音频附件 &rarr; 自动识别格式（m4a/mp3/wav） &rarr; 本地模型转录 &rarr; 长音频自动分片拼接</p>
-      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 11 同源）：附件与转录进度">
-        <img src="flow-stills/flow-interview-01.jpg" alt="Interview 录屏：音频处理与对话界面" loading="lazy" width="900" height="506" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:780">
+        <span>🎙️ 音频识别 &amp; 转录进度示意</span>
+        <p>收到 .m4a 附件 → 自动识别时长 → 超 60 分钟分片（20 分钟/片，重叠 10 秒）→ 本地模型转录 → 合并去重</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：手动整理半天</span>
@@ -2550,9 +2618,10 @@ deck-stage > section {
       <span class="fp-tag">按模板结构化</span>
       <h3>内容整理 &amp; 规范化</h3>
       <p class="fp-desc">选择模板（7 套可选） &rarr; 行业术语自动标准化 &rarr; 人名对照还原 &rarr; Q&amp;A List 全覆盖</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1030" title="Demo 录屏（slide 11 同源）：结构化输出">
-        <img src="flow-stills/flow-interview-02.jpg" alt="Interview 录屏：结构化模板与正文生成" loading="lazy" width="900" height="506" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1030">
+        <span>📝 结构化模板填充示意</span>
+        <p>7 套模板可选（面试 / 会议 / 谈薪等）→ 术语自动标准化 → Q&amp;A List 全覆盖 → 7300+ 字结构化文档</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：信息散落脑子里</span>
@@ -2570,9 +2639,10 @@ deck-stage > section {
       <span class="fp-tag">自动发到学城</span>
       <h3>发布 &amp; 存档</h3>
       <p class="fp-desc">结构化文档自动发布到学城 &rarr; 录音原件上传为附件 &rarr; 对话框只输出一行链接</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1280" title="Demo 录屏（slide 11 同源）：学城链接与交付">
-        <img src="flow-stills/flow-interview-03.jpg" alt="Interview 录屏：发布学城与任务收尾" loading="lazy" width="900" height="506" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1280">
+        <span>🔗 学城发布 &amp; 交付示意</span>
+        <p>结构化文档自动发布学城 → 录音原件作附件挂文档末尾 → 对话框只输出一行学城链接 → 大象通知推送</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：产出散落各处</span>
@@ -2620,10 +2690,13 @@ deck-stage > section {
       </div>
     </div>
     <div class="demo-right">
-      <div class="demo-screen" data-anim="scale" style="--d:1300">
-        <video controls autoplay muted loop playsinline style="width:100%;height:100%;object-fit:contain;border-radius:8px;cursor:pointer;">
-          <source src="demo_interview_30s.mp4" type="video/mp4">
-        </video>
+      <div class="demo-screen demo-screen-placeholder" data-anim="scale" style="--d:1300">
+        <div class="placeholder-inner">
+          <div class="placeholder-icon">▶</div>
+          <div class="placeholder-title">Interview Demo 录屏</div>
+          <div class="placeholder-desc">3h46m 面试录音 → 8 段分片转录 → 闪闪模板结构化 → 学城发布 + 大象通知<br>全程 12 分钟，视频为精华剪辑版（约 30 秒）</div>
+          <div class="placeholder-note">演示视频仅供内部参考，未随文档公开发布</div>
+        </div>
       </div>
     </div>
   </div>
@@ -2650,9 +2723,10 @@ deck-stage > section {
       <span class="fp-tag">识别所有输入</span>
       <h3>文档扫描 &amp; 分级</h3>
       <p class="fp-desc">识别所有输入文档（PDF/Word/Excel/TXT） &rarr; 梳理时间线 &rarr; 来源质量分级（一手 &gt; 二手 &gt; 三手）</p>
-      <figure class="fp-still" data-anim="fade" style="--d:780" title="Demo 录屏（slide 13 同源）：文档输入与任务面板">
-        <img src="flow-stills/flow-research-01.jpg" alt="Research 录屏：多文档输入与进度" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:780">
+        <span>📂 文档扫描 &amp; 分级示意</span>
+        <p>识别 PDF/Word/Excel/TXT → 梳理时间线 → 来源质量分级（一手 &gt; 二手 &gt; 三手）→ 可追溯约束生效</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">核心原则：只描述不创作</span>
@@ -2666,9 +2740,10 @@ deck-stage > section {
       <span class="fp-tag">深度分析内容</span>
       <h3>术语 &amp; 观点 &amp; 时间线</h3>
       <p class="fp-desc">专业术语提取 &rarr; 时间线重构 &rarr; 观点演进追踪 &rarr; 争议项标注 &rarr; 置信度分层（HIGH/MED/LOW）</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1030" title="Demo 录屏（slide 13 同源）：分析与提纲">
-        <img src="flow-stills/flow-research-02.jpg" alt="Research 录屏：深度分析与结构化提纲" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1030">
+        <span>🧠 观点矩阵 &amp; 时间线重构示意</span>
+        <p>专业术语提取 → 跨文档观点演进追踪 → 争议项标注 → 置信度分层（HIGH / MED / LOW）</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：信息碎片化</span>
@@ -2682,9 +2757,10 @@ deck-stage > section {
       <span class="fp-tag">三源补充检索</span>
       <h3>本地 + 网络 + 学城</h3>
       <p class="fp-desc">动笔前强制三路检索：本地研究库 grep &rarr; web_search 搜公开信息 &rarr; 学城搜已有文档</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1280" title="Demo 录屏（slide 13 同源）：检索与引用">
-        <img src="flow-stills/flow-research-03.jpg" alt="Research 录屏：三源检索与引用轨迹" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1280">
+        <span>🔎 三源检索 &amp; 引用轨迹示意</span>
+        <p>本地研报库 grep → web_search 公开信息 → 学城已有文档 → 三路全跑完再动笔，每条结论必须有出处</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：信息不全就动笔</span>
@@ -2698,9 +2774,10 @@ deck-stage > section {
       <span class="fp-tag">生成高保真报告</span>
       <h3>撰写 &amp; 发布</h3>
       <p class="fp-desc">按模板生成报告 &rarr; 末尾列出信息缺口地图 &rarr; 发布到学城 &rarr; 可衔接 Benchmark 的 Tier 分层</p>
-      <figure class="fp-still" data-anim="fade" style="--d:1530" title="Demo 录屏（slide 13 同源）：成稿与发布">
-        <img src="flow-stills/flow-research-04.jpg" alt="Research 录屏：报告生成与学城发布" loading="lazy" width="800" height="450" />
-      </figure>
+      <div class="fp-still fp-still-placeholder" data-anim="fade" style="--d:1530">
+        <span>📄 报告生成 &amp; 学城发布示意</span>
+        <p>按模板生成报告 → 末尾附信息缺口地图 → 发布学城 → 可衔接 Benchmark Tier 分层 → 大象推送</p>
+      </div>
       <div class="fp-details">
         <div class="fp-detail">
           <span class="detail-label">解决：报告写完没下文</span>
@@ -2748,8 +2825,13 @@ deck-stage > section {
       </div>
     </div>
     <div class="demo-right">
-      <div class="demo-screen has-video" data-anim="scale" style="--d:1300">
-        <video class="demo-video" src="demo_research_30s.mp4" muted loop playsinline preload="metadata"></video>
+      <div class="demo-screen demo-screen-placeholder" data-anim="scale" style="--d:1300">
+        <div class="placeholder-inner">
+          <div class="placeholder-icon">▶</div>
+          <div class="placeholder-title">Research Demo 录屏</div>
+          <div class="placeholder-desc">20 份散碎研报输入 → 三源检索补充 → 产业链四层分析 → 万字报告学城发布<br>全程 8 分钟，视频为精华剪辑版（约 30 秒）</div>
+          <div class="placeholder-note">演示视频仅供内部参考，未随文档公开发布</div>
+        </div>
       </div>
     </div>
   </div>
